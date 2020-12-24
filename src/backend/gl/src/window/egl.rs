@@ -142,7 +142,12 @@ impl hal::Instance<crate::Backend> for Instance {
             Ok(Some(config)) => config,
             Ok(None) => {
                 log::warn!("no compatible EGL config found, trying off-screen");
-                supports_native_window = false;
+                // Android surface still presentable
+                supports_native_window = if cfg!(target_os = "android") {
+                    true
+                } else {
+                    false
+                };
                 let reduced_config_attributes =
                     [egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE];
                 match egl.choose_first_config(display, &reduced_config_attributes) {
@@ -163,7 +168,7 @@ impl hal::Instance<crate::Backend> for Instance {
             egl::CONTEXT_CLIENT_VERSION,
             3, // Request GLES 3.0 or higher
         ];
-        if cfg!(debug_assertions) && wsi_library.is_none() {
+        if cfg!(debug_assertions) && wsi_library.is_none() && cfg!(not(target_os = "android")) {
             //TODO: figure out why this is needed
             context_attributes.push(egl::CONTEXT_OPENGL_DEBUG);
             context_attributes.push(egl::TRUE as _);
@@ -194,7 +199,10 @@ impl hal::Instance<crate::Backend> for Instance {
             .unwrap();
         let context = unsafe {
             glow::Context::from_loader_function(|name| {
-                self.egl.get_proc_address(name).unwrap() as *const _
+                match self.egl.get_proc_address(name) {
+                    Some(ext) => ext as *const _,
+                    _ => std::ptr::null() as *const _,
+                }
             })
         };
         // Create physical device
@@ -217,16 +225,23 @@ impl hal::Instance<crate::Backend> for Instance {
         };
         let attributes = [
             egl::RENDER_BUFFER as usize,
-            egl::SINGLE_BUFFER as usize,
+            egl::BACK_BUFFER as usize,
             // Always enable sRGB
             egl::GL_COLORSPACE as usize,
             egl::GL_COLORSPACE_SRGB as usize,
             egl::ATTRIB_NONE,
         ];
+
+        let native_window_ptr = match has_handle.raw_window_handle() {
+            #[cfg(target_os = "android")]
+            Rwh::Android(_) => native_window as *mut _ as _,
+            _ => &mut native_window as *mut _ as *mut _,
+        };
+
         match self.egl.create_platform_window_surface(
             self.display,
             self.config,
-            &mut native_window as *mut _ as *mut _,
+            native_window_ptr,
             &attributes,
         ) {
             Ok(raw) => Ok(Surface {
