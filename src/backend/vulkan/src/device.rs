@@ -2122,6 +2122,7 @@ impl d::Device<B> for Device {
             Ok(()) => Ok(()),
             Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY) => Err(d::OutOfMemory::Host),
             Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => Err(d::OutOfMemory::Device),
+            Err(e) => { println!("{:?} | {:?}", vk::Result::from(e), vk::Result::from(e).as_raw()); panic!() } ,
             _ => unreachable!(),
         }
     }

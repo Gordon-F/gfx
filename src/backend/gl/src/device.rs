@@ -141,6 +141,22 @@ impl Device {
                     gl.delete_shader(shader);
                 }
             }
+
+            // Generate empty Fragment Shader if it note present
+            // TODO: only if Vertex Stage present
+            if stage == ShaderStage::Fragment && point_maybe.is_none() {
+                let empty_fragment_shader = r#"#version 300 es
+
+                void main(void) {}"#;
+                info!("Empty fragment shader {}", empty_fragment_shader);
+                let shader = self
+                    .create_shader_module_raw(empty_fragment_shader, ShaderStage::Fragment)
+                    .unwrap();
+                unsafe {
+                    gl.attach_shader(program, shader);
+                    gl.delete_shader(shader);
+                }
+            }
         }
 
         unsafe {
@@ -205,6 +221,7 @@ impl Device {
                 gl.framebuffer_texture_2d(
                     point,
                     attachment,
+                    //glow::TEXTURE_2D,
                     target,
                     Some(raw),
                     sub.level_start as _,
@@ -401,7 +418,7 @@ impl Device {
             } else {
                 ast.unset_decoration(res.id, spirv::Decoration::Binding)
                     .unwrap();
-                assert!(nb_map.insert(res.name.clone(), (register, slot)).is_none());
+                //assert!(nb_map.insert(res.name.clone(), (register, slot)).is_none());
             }
             ast.unset_decoration(res.id, spirv::Decoration::DescriptorSet)
                 .unwrap();

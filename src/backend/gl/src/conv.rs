@@ -232,7 +232,7 @@ pub fn describe_format(format: Format) -> Option<FormatDescription> {
             Float,
         ),
         D32Sfloat => {
-            FormatDescription::new(glow::DEPTH_COMPONENT32F, glow::DEPTH, glow::FLOAT, 1, Float)
+            FormatDescription::new(glow::DEPTH_COMPONENT32F, glow::DEPTH_COMPONENT, glow::FLOAT, 1, Float)
         }
         D32SfloatS8Uint => FormatDescription::new(
             glow::DEPTH32F_STENCIL8,

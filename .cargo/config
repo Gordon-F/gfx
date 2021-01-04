@@ -1,0 +1,40 @@
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-lc++_static",
+    "-C", "link-arg=-lc++abi",
+    "-C", "link-arg=-lEGL",
+    "-C", "link-arg=-lGLESv3",
+    "-C", "link-arg=-llog",
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+    # "-C", "link-arg=-lc++_static",
+    #"-C", "link-arg=-lc++abi",
+    "-C", "link-arg=-lc++_shared",
+    "-C", "link-arg=-lEGL",
+    "-C", "link-arg=-lGLESv3",
+    "-C", "link-arg=-llog",
+    "-C", "link-arg=-ldl",
+    "-C", "link-arg=-landroid",
+    "-C", "link-arg=-lc",
+    "-C", "link-arg=-lm",
+]
+
+[target.i686-linux-android]
+rustflags = [
+    "-C", "link-arg=-lc++_static",
+    "-C", "link-arg=-lc++abi",
+    "-C", "link-arg=-lEGL",
+    "-C", "link-arg=-lGLESv3",
+    "-C", "link-arg=-llog",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+    "-C", "link-arg=-lc++_static",
+    "-C", "link-arg=-lc++abi",
+    "-C", "link-arg=-lEGL",
+    "-C", "link-arg=-lGLESv3",
+    "-C", "link-arg=-llog",
+]
