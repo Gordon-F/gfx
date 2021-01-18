@@ -108,7 +108,6 @@ fn main() {
 
     // It is important that the closure move captures the Renderer,
     // otherwise it will not be dropped when the event loop exits.
-    /*
     event_loop.run(move |event, _, control_flow| {
         *control_flow = winit::event_loop::ControlFlow::Wait;
 
@@ -141,7 +140,6 @@ fn main() {
             _ => {}
         }
     });
-     */
 }
 
 struct Renderer<B: hal::Backend> {
