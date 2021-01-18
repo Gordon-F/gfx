@@ -24,15 +24,14 @@ ndk-glue = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies.gfx-backend-gl]
 path = "../../src/backend/gl"
-version = "0.6"
 optional = true
 
 [package.metadata.android]
 package_name = "com.rust.game"
 label = "GfxQuad"
 # Vulkan supports on devices running Android API level 24 or higher.
-target_sdk_version = 24
-min_sdk_version = 24
+target_sdk_version = 29
+min_sdk_version = 29
 fullscreen = true
-build_targets = [ "aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android" ]
 opengles_version = [3, 0]
+orientation = "sensorLandscape"

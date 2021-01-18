@@ -56,8 +56,6 @@ const QUAD: [Vertex; 6] = [
 #[cfg(target_os = "android")]
 #[cfg_attr(target_os = "android", ndk_glue::main(backtrace = "full"))]
 fn main() {
-    android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Trace));
-
     {
         println!("Waiting for NativeScreen");
         loop {
@@ -70,6 +68,8 @@ fn main() {
             }
         }
     }
+
+    android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Trace));
 
     let event_loop = winit::event_loop::EventLoop::new();
 
