@@ -14,6 +14,13 @@ adb shell /system/bin/screencap -p /sdcard/screenshot.png
 adb pull /sdcard/screenshot.png ~/screenshot.png
 adb logcat *:S RustStdoutStderr:V -d > ~/logcat.log
 
+if grep 'gfx_backend_gl' ~/logcat.log;
+then
+    echo "App running"
+else
+    exit 1
+fi
+
 if grep -e 'thread.*panicked at' ~/logcat.log;
 then
     exit 1
