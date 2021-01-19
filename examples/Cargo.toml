@@ -45,7 +45,7 @@ auxil = { path = "../src/auxil/auxil", version = "0.5", package = "gfx-auxil" }
 gfx-backend-empty = { path = "../src/backend/empty", version = "0.6" }
 winit = { version = "0.24", features = ["web-sys"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(all(target_os = "android", target_arch = "wasm32")))'.dependencies]
 env_logger = "0.8"
 glsl-to-spirv = "0.1.4"
 
