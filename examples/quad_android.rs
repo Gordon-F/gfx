@@ -3,6 +3,9 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "./quad/main.rs"));
 #[cfg(target_os = "android")]
 #[cfg_attr(target_os = "android", ndk_glue::main(backtrace = "full"))]
 fn main() {
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    dbg!(manifest);
+
     #[cfg(not(feature = "gl",))]
     eprintln!(
         "This example will run only on CI."
