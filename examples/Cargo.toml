@@ -30,6 +30,13 @@ path = "compute/main.rs"
 name = "mesh-shading"
 path = "mesh-shading/main.rs"
 
+# Android CI example
+[[example]]
+name = "quad_android"
+path = "quad_android.rs"
+crate-type = ["dylib"]
+required-features = ["gl"]
+
 [dependencies]
 image = "0.23.12"
 log = "0.4"
@@ -80,3 +87,17 @@ optional = true
 path = "../src/backend/dx12"
 version = "0.6"
 optional = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.9"
+ndk-glue = "0.2"
+
+[package.metadata.android]
+package_name = "com.rust.game"
+label = "GfxQuad"
+# Vulkan supports on devices running Android API level 24 or higher.
+target_sdk_version = 29
+min_sdk_version = 29
+fullscreen = true
+opengles_version = [3, 0]
+orientation = "sensorLandscape"

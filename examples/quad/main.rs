@@ -71,7 +71,12 @@ const QUAD: [Vertex; 6] = [
     Vertex { a_Pos: [ -0.5,-0.33 ], a_Uv: [0.0, 0.0] },
 ];
 
+#[cfg(not(target_os = "android"))]
 fn main() {
+    run();
+}
+
+fn run() {
     #[cfg(target_arch = "wasm32")]
     console_log::init_with_level(log::Level::Debug).unwrap();
 

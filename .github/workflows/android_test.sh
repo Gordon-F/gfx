@@ -2,9 +2,11 @@
 
 set -ex
 
+cd examples
+
 rustup target install x86_64-linux-android
 cargo install cargo-apk
-cargo apk run --package quad_android --target x86_64-linux-android
+cargo apk run --example quad_android --target x86_64-linux-android
 
 sleep 30s
 
