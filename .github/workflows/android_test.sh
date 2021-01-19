@@ -6,7 +6,7 @@ cd examples
 
 rustup target install x86_64-linux-android
 cargo install cargo-apk
-cargo apk run --example quad_android --target x86_64-linux-android
+cargo apk run --example quad_android --target x86_64-linux-android --features gl
 
 sleep 30s
 
