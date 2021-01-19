@@ -18,8 +18,3 @@ members = [
 
 [patch."https://github.com/gfx-rs/naga"]
 #naga = { path = "../naga" }
-[patch."https://github.com/timothee-haudebourg/khronos-egl"]
-egl = { package = "khronos-egl", path = "../khronos-egl", features = ["dynamic"] }
-
-# [patch.crates-io]
-# glow = { path = "../glow" }
