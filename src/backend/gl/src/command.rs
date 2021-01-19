@@ -524,7 +524,8 @@ impl CommandBuffer {
         let attachment_indices = subpass
             .color_attachments
             .iter()
-            .map(|&index| state.attachments[index].color_index.unwrap())
+            .map(|&index| state.attachments[index].color_index)
+            .filter_map(|e| e)
             .collect();
         self.data
             .push_cmd(Command::SetDrawColorBuffers(attachment_indices));
@@ -815,6 +816,8 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         let mut depth_stencil = None;
 
         for info in attachment_infos {
+            dbg!(&info);
+
             let view = info.image_view.clone();
             let aspects = view.aspects();
             let color_index = if aspects.contains(Aspects::COLOR) {

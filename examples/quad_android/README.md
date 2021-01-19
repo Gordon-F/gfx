@@ -1,5 +1,3 @@
-# Quad
+# Quad Android
 
-The following image is an output of `cargo run --bin quad --features=gl`:
-
-![screenshot](screenshot.png "Quad")
+The following example is used only for the Android CI process.

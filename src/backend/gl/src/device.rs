@@ -356,7 +356,7 @@ impl Device {
                 _ => {
                     return Err(d::ShaderError::CompilationFailed(
                         "Unsupported execution model".into(),
-                    ));
+                    ))
                 }
             },
         ));
