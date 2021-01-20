@@ -13,6 +13,7 @@ default = ["gl"]
 gl = ["gfx-backend-gl"]
 
 [target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.9"
 image = "0.23.12"
 log = "0.4"
 hal = { path = "../../src/hal", package = "gfx-hal" }
