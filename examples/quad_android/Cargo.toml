@@ -19,7 +19,7 @@ hal = { path = "../../src/hal", package = "gfx-hal" }
 auxil = { path = "../../src/auxil/auxil", package = "gfx-auxil" }
 gfx-backend-empty = { path = "../../src/backend/empty" }
 winit = "0.24"
-ndk-glue = "0.2"
+ndk-glue = { version = "0.2", features = ["logger"] }
 
 [target.'cfg(target_os = "android")'.dependencies.gfx-backend-gl]
 path = "../../src/backend/gl"
