@@ -6,13 +6,13 @@ rustup target install x86_64-linux-android
 cargo install cargo-apk
 cargo apk run --package quad_android --target x86_64-linux-android
 
-sleep 1m
+sleep 30s
 
 adb shell /system/bin/screencap -p /sdcard/screenshot.png
 adb pull /sdcard/screenshot.png ~/screenshot.png
 adb logcat *:S RustStdoutStderr:V -d > ~/logcat.log
 
-if grep 'App started. Waiting for NativeScreen' ~/logcat.log;
+if grep 'RustStdoutStderr' ~/logcat.log;
 then
     echo "App running"
 else
