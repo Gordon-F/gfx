@@ -92,7 +92,10 @@ impl Version {
             } else {
                 s.trim_end_matches('0')
             };
-            trimmed.parse().ok()
+            match trimmed.chars().next() {
+                Some(c) => c.to_digit(10),
+                None => None
+            }
         });
         let revision = it.next().and_then(|s| s.parse().ok());
 
@@ -601,6 +604,10 @@ mod tests {
         );
         assert_eq!(
             Version::parse("OpenGL ES GLSL ES 3.20"),
+            Ok(Version::new_embedded(3, 2, String::new()))
+        );
+        assert_eq!(
+            Version::parse("GLSL ES 3.2()"),
             Ok(Version::new_embedded(3, 2, String::new()))
         );
     }

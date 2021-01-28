@@ -48,7 +48,7 @@ type WlDisplayConnectFun =
 
 type WlDisplayDisconnectFun = unsafe extern "system" fn(display: *const raw::c_void);
 
-#[cfg(not(any(target_os = "android", target_os = "macos")))]
+#[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
 type WlEglWindowCreateFun = unsafe extern "system" fn(
     surface: *const raw::c_void,
     width: raw::c_int,
@@ -177,7 +177,10 @@ impl Inner {
             egl::CONTEXT_CLIENT_VERSION,
             3, // Request GLES 3.0 or higher
         ];
-        if cfg!(debug_assertions) && wsi_library.is_none() && !cfg!(target_os = "android") {
+        if cfg!(debug_assertions)
+            && wsi_library.is_none()
+            && !cfg!(any(target_os = "android", target_os = "windows"))
+        {
             //TODO: figure out why this is needed
             context_attributes.push(egl::CONTEXT_OPENGL_DEBUG);
             context_attributes.push(egl::TRUE as _);
@@ -226,7 +229,15 @@ impl Drop for Inner {
 
 impl hal::Instance<crate::Backend> for Instance {
     fn create(_: &str, _: u32) -> Result<Self, hal::UnsupportedBackend> {
-        let egl = match unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() } {
+        // Windows supports only for debugging purpose
+        let lib_filename = if !cfg!(target_os = "windows") {
+            "libEGL.so"
+        } else {
+            "libEGL.dll"
+        };
+        let lib = libloading::Library::new(lib_filename)
+            .expect(&format!("unable to find {}", lib_filename));
+        let egl = match unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) } {
             Ok(egl) => Starc::new(egl),
             Err(e) => {
                 log::warn!("Unable to open libEGL.so: {:?}", e);
@@ -320,24 +331,26 @@ impl hal::Instance<crate::Backend> for Instance {
     ) -> Result<Surface, w::InitError> {
         use raw_window_handle::RawWindowHandle as Rwh;
 
+        #[allow(unused_mut)]
         let mut inner = self.inner.lock();
+        #[allow(unused_mut)]
         let mut wl_window = None;
-        #[cfg(not(any(target_os = "android", target_os = "macos")))]
+        #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
         let (mut temp_xlib_handle, mut temp_xcb_handle);
         let native_window_ptr = match has_handle.raw_window_handle() {
-            #[cfg(not(any(target_os = "android", target_os = "macos")))]
+            #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
             Rwh::Xlib(handle) => {
                 temp_xlib_handle = handle.window;
                 &mut temp_xlib_handle as *mut _ as *mut std::ffi::c_void
             }
-            #[cfg(not(any(target_os = "android", target_os = "macos")))]
+            #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
             Rwh::Xcb(handle) => {
                 temp_xcb_handle = handle.window;
                 &mut temp_xcb_handle as *mut _ as *mut std::ffi::c_void
             }
             #[cfg(target_os = "android")]
             Rwh::Android(handle) => handle.a_native_window as *mut _ as *mut std::ffi::c_void,
-            #[cfg(not(any(target_os = "android", target_os = "macos")))]
+            #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "windows")))]
             Rwh::Wayland(handle) => {
                 /* Wayland displays are not sharable between surfaces so if the
                  * surface we receive from this handle is from a different
@@ -383,6 +396,9 @@ impl hal::Instance<crate::Backend> for Instance {
                 wl_window = Some(result);
                 result
             }
+            // Only for debugging purpose
+            #[cfg(target_os = "windows")]
+            Rwh::Windows(handle) => handle.hwnd as *mut _ as *mut std::ffi::c_void,
             other => {
                 error!("Unsupported window: {:?}", other);
                 return Err(w::InitError::UnsupportedWindowHandle);
