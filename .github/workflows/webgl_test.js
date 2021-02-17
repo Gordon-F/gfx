@@ -2,6 +2,7 @@ const puppeteer = require('puppeteer-core');
 
 (async () => {
     const browser = await puppeteerlaunch({
+        headless: true,
         args: [
             '--use-gl=swiftshader'
         ]
