@@ -1,16 +1,40 @@
 use crate::{Error, GlContainer, MAX_COLOR_ATTACHMENTS};
 use glow::HasContext;
 use hal::{PhysicalDeviceProperties, DynamicStates, Features, Limits, PerformanceCaveats};
-use std::{collections::HashSet, fmt, str};
+use std::{cmp::Ordering, collections::HashSet, fmt, str};
 
 /// A version number for a specific component of an OpenGL implementation
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord)]
 pub struct Version {
     pub is_embedded: bool,
     pub major: u32,
     pub minor: u32,
     pub revision: Option<u32>,
     pub vendor_info: String,
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_embedded == other.is_embedded && self.major == other.major && self.minor == other.minor
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self.major == other.major && self.minor == self.minor {
+            Some(Ordering::Equal)
+        } else if self.major > other.major {
+            Some(Ordering::Greater)
+        } else if self.major < other.major {
+            Some(Ordering::Less)
+        } else if self.major == other.major && self.minor > other.minor {
+            Some(Ordering::Greater)
+        } else if self.major == other.major && self.minor < other.minor {
+            Some(Ordering::Less)
+        } else {
+            None
+        }
+    }
 }
 
 impl Version {
