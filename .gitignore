@@ -14,3 +14,7 @@ examples/generated-wasm
 # Service
 Cargo.lock
 *.swp
+
+# Node
+node_modules/
+package-lock.json
