@@ -7,30 +7,6 @@ on:
     branches-ignore: [staging.tmp]
 
 jobs:
-  ios_build:
-    name: iOS Stable
-    runs-on: macos-10.15
-    env:
-      TARGET: aarch64-apple-ios
-    steps:
-      - uses: actions/checkout@v2
-      - name: Prepare Rust
-        run: rustup target add ${{ env.TARGET }}
-      - run: cargo check --manifest-path src/backend/metal/Cargo.toml --target ${{ env.TARGET }}
-
-  android_build:
-    name: Android Stable
-    runs-on: ubuntu-18.04
-    env:
-      TARGET: aarch64-linux-android
-    steps:
-      - uses: actions/checkout@v2
-      - run: echo "$ANDROID_HOME/ndk-bundle/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
-      - name: Prepare Rust
-        run: rustup target add ${{ env.TARGET }}
-      - run: cargo check --manifest-path src/backend/vulkan/Cargo.toml --target ${{ env.TARGET }}
-      - run: cargo check --manifest-path src/backend/gl/Cargo.toml --target ${{ env.TARGET }}
-
   webgl_build:
     name: Web Assembly
     runs-on: ubuntu-18.04
@@ -38,24 +14,12 @@ jobs:
       - uses: actions/checkout@v2
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo build --manifest-path examples/Cargo.toml --features gl --target wasm32-unknown-unknown --bin quad
-
-  check-advisories:
-    name: Advisory Check
-    runs-on: ubuntu-18.04
-    steps:
-      - uses: actions/checkout@v2
-      - uses: EmbarkStudios/cargo-deny-action@v1
-        with:
-          command: check advisories
-
-  check-dependencies:
-    name: Dependency Check
-    runs-on: ubuntu-18.04
-    steps:
-      - uses: actions/checkout@v2
-      - uses: EmbarkStudios/cargo-deny-action@v1
-        with:
-          command: check bans licenses sources
+      - run: cargo install -f wasm-bindgen-cli --version 0.2.69
+      - run: wasm-bindgen --out-dir target/generated --web target/wasm32-unknown-unknown/debug/quad.wasm
+      - run: mv ./.github/workflows/index.html ./target/generated/
+      - run: npm i puppeteer-core
+      - run: ruby -run -e httpd -p 8000 ./target/generated &
+      - run: node ./.github/workflows/webgl_test.js
 
   build:
     name: ${{ matrix.name }}
