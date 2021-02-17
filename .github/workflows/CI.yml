@@ -17,8 +17,8 @@ jobs:
       - run: cargo install -f wasm-bindgen-cli --version 0.2.69
       - run: wasm-bindgen --out-dir target/generated --web target/wasm32-unknown-unknown/debug/quad.wasm
       - run: mv ./.github/workflows/index.html ./target/generated/
-      - run: curl -O --output-dir ./target/generated/ https://github.com/grovesNL/spirv_cross/raw/master/wasm/spirv_cross_wrapper_glsl.wasm
-      - run: curl -O --output-dir ./target/generated/ https://github.com/grovesNL/spirv_cross/raw/master/wasm/spirv_cross_wrapper_glsl.js
+      - run: wget -O ./target/generated/spirv_cross_wrapper_glsl.wasm https://github.com/grovesNL/spirv_cross/raw/master/wasm/spirv_cross_wrapper_glsl.wasm
+      - run: wget -O ./target/generated/spirv_cross_wrapper_glsl.js https://github.com/grovesNL/spirv_cross/raw/master/wasm/spirv_cross_wrapper_glsl.js
       - run: npm i puppeteer-core
       - run: ruby -run -e httpd -p 8000 ./target/generated &
       - run: node ./.github/workflows/webgl_test.js
