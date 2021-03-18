@@ -1,6 +1,6 @@
 [package]
 name = "gfx-backend-gl"
-version = "0.6.0"
+version = "0.7.0"
 description = "OpenGL backend for gfx-rs"
 homepage = "https://github.com/gfx-rs/gfx"
 repository = "https://github.com/gfx-rs/gfx"
@@ -17,29 +17,38 @@ name = "gfx_backend_gl"
 
 [features]
 default = []
+cross = ["spirv_cross", "auxil", "naga/spv-out"]
 
 [dependencies]
 arrayvec = "0.5"
 bitflags = "1"
+fxhash = "0.2.1"
 log = "0.4"
-hal = { path = "../../hal", version = "0.6", package = "gfx-hal" }
-auxil = { path = "../../auxil/auxil", version = "0.5", package = "gfx-auxil", features = ["spirv_cross"] }
-smallvec = "1.0"
-glow = "0.7.1"
+hal = { package = "gfx-hal", path = "../../hal", version = "0.7" }
+glow = "0.7.2"
 parking_lot = "0.11"
-spirv_cross = { version = "0.22.2", features = ["glsl"]}
 raw-window-handle = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-egl = { package = "khronos-egl", git = "https://github.com/timothee-haudebourg/khronos-egl", rev = "9568b2ee3b02f2c17cc9479f824db16daecf1664", features = ["dynamic"] }
-libloading = "0.6"
+egl = { package = "khronos-egl", version = "4", features = ["dynamic"] }
+libloading = "0.7"
+
+[dependencies.auxil]
+package = "gfx-auxil"
+path = "../../auxil/auxil"
+version = "0.8"
+features = ["spirv_cross"]
+optional = true
+
+[dependencies.spirv_cross]
+version = "0.23"
+features = ["glsl"]
+optional = true
 
 [dependencies.naga]
 git = "https://github.com/gfx-rs/naga"
-tag = "gfx-6"
-#TODO: remove `spv-out` once spirv-cross is deprecated
-features = ["spv-out", "glsl-out"]
-optional = true
+tag = "gfx-16"
+features = ["spv-in", "glsl-out"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.6"

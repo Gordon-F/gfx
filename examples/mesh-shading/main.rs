@@ -31,16 +31,8 @@ pub fn wasm_main() {
 }
 
 use hal::{
-    buffer, command, format as f,
-    format::ChannelType,
-    image as i, memory as m, pass,
-    pass::Subpass,
-    pool,
-    prelude::*,
-    pso,
-    pso::ShaderStageFlags,
-    queue::{QueueGroup, Submission},
-    window,
+    buffer, command, format as f, format::ChannelType, image as i, memory as m, pass,
+    pass::Subpass, pool, prelude::*, pso, pso::ShaderStageFlags, queue::QueueGroup, window,
 };
 
 use std::{
@@ -203,7 +195,7 @@ where
         adapter: hal::adapter::Adapter<B>,
     ) -> Renderer<B> {
         let memory_types = adapter.physical_device.memory_properties().memory_types;
-        let limits = adapter.physical_device.limits();
+        let limits = adapter.physical_device.properties().limits;
 
         // Build a new device and associated command queues
         let family = adapter
@@ -231,7 +223,7 @@ where
         let set_layout = ManuallyDrop::new(
             unsafe {
                 device.create_descriptor_set_layout(
-                    &[pso::DescriptorSetLayoutBinding {
+                    iter::once(pso::DescriptorSetLayoutBinding {
                         binding: 0,
                         ty: pso::DescriptorType::Buffer {
                             ty: pso::BufferDescriptorType::Storage { read_only: true },
@@ -242,8 +234,8 @@ where
                         count: 1,
                         stage_flags: ShaderStageFlags::MESH,
                         immutable_samplers: false,
-                    }],
-                    &[],
+                    }),
+                    iter::empty(),
                 )
             }
             .expect("Can't create descriptor set layout"),
@@ -254,7 +246,7 @@ where
             unsafe {
                 device.create_descriptor_pool(
                     1, // sets
-                    &[pso::DescriptorRangeDesc {
+                    iter::once(pso::DescriptorRangeDesc {
                         ty: pso::DescriptorType::Buffer {
                             ty: pso::BufferDescriptorType::Storage { read_only: true },
                             format: pso::BufferDescriptorFormat::Structured {
@@ -262,13 +254,13 @@ where
                             },
                         },
                         count: 1,
-                    }],
+                    }),
                     pso::DescriptorPoolCreateFlags::empty(),
                 )
             }
             .expect("Can't create descriptor pool"),
         );
-        let mut desc_set = unsafe { desc_pool.allocate_set(&set_layout) }.unwrap();
+        let mut desc_set = unsafe { desc_pool.allocate_one(&set_layout) }.unwrap();
 
         // Buffer allocations
         println!("Memory types: {:?}", memory_types);
@@ -288,7 +280,14 @@ where
             * non_coherent_alignment;
 
         let mut positions_buffer = ManuallyDrop::new(
-            unsafe { device.create_buffer(padded_buffer_len, buffer::Usage::STORAGE) }.unwrap(),
+            unsafe {
+                device.create_buffer(
+                    padded_buffer_len,
+                    buffer::Usage::STORAGE,
+                    hal::memory::SparseFlags::empty(),
+                )
+            }
+            .unwrap(),
         );
 
         let buffer_req = unsafe { device.get_buffer_requirements(&positions_buffer) };
@@ -332,7 +331,7 @@ where
                 set: &mut desc_set,
                 binding: 0,
                 array_offset: 0,
-                descriptors: Some(pso::Descriptor::Buffer(
+                descriptors: iter::once(pso::Descriptor::Buffer(
                     &*positions_buffer,
                     buffer::SubRange::WHOLE,
                 )),
@@ -381,8 +380,14 @@ where
             };
 
             ManuallyDrop::new(
-                unsafe { device.create_render_pass(&[attachment], &[subpass], &[]) }
-                    .expect("Can't create render pass"),
+                unsafe {
+                    device.create_render_pass(
+                        iter::once(attachment),
+                        iter::once(subpass),
+                        iter::empty(),
+                    )
+                }
+                .expect("Can't create render pass"),
             )
         };
 
@@ -445,7 +450,7 @@ where
         }
 
         let pipeline_layout = ManuallyDrop::new(
-            unsafe { device.create_pipeline_layout(iter::once(&*set_layout), &[]) }
+            unsafe { device.create_pipeline_layout(iter::once(&*set_layout), iter::empty()) }
                 .expect("Can't create pipeline layout"),
         );
         let pipeline = {
@@ -615,14 +620,14 @@ where
         unsafe {
             cmd_buffer.begin_primary(command::CommandBufferFlags::ONE_TIME_SUBMIT);
 
-            cmd_buffer.set_viewports(0, &[self.viewport.clone()]);
-            cmd_buffer.set_scissors(0, &[self.viewport.rect]);
+            cmd_buffer.set_viewports(0, iter::once(self.viewport.clone()));
+            cmd_buffer.set_scissors(0, iter::once(self.viewport.rect));
             cmd_buffer.bind_graphics_pipeline(&self.pipeline);
             cmd_buffer.bind_graphics_descriptor_sets(
                 &self.pipeline_layout,
                 0,
                 iter::once(&self.desc_set),
-                &[],
+                iter::empty(),
             );
 
             cmd_buffer.begin_render_pass(
@@ -643,13 +648,10 @@ where
             cmd_buffer.end_render_pass();
             cmd_buffer.finish();
 
-            let submission = Submission {
-                command_buffers: iter::once(&*cmd_buffer),
-                wait_semaphores: None,
-                signal_semaphores: iter::once(&self.submission_complete_semaphores[frame_idx]),
-            };
             self.queue_group.queues[0].submit(
-                submission,
+                iter::once(&*cmd_buffer),
+                iter::empty(),
+                iter::once(&self.submission_complete_semaphores[frame_idx]),
                 Some(&mut self.submission_complete_fences[frame_idx]),
             );
 

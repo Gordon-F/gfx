@@ -14,7 +14,7 @@ mod command;
 mod device;
 mod window;
 
-pub use crate::command::{CommandBuffer, CommandPool, CommandQueue};
+pub use crate::command::{CommandBuffer, CommandPool, Queue};
 pub use crate::device::Device;
 pub use crate::window::{Surface, Swapchain};
 
@@ -28,7 +28,7 @@ impl hal::Backend for Backend {
     type Surface = Surface;
 
     type QueueFamily = QueueFamily;
-    type CommandQueue = command::CommandQueue;
+    type Queue = command::Queue;
     type CommandBuffer = command::CommandBuffer;
 
     type Memory = ();
@@ -109,13 +109,11 @@ impl Instance {
         // we can return them and let the application choose.
         if high_performance_adapter != low_power_adapter {
             high_performance_adapter
-                .into_iter()
                 .chain(low_power_adapter)
                 .map(map_wgpu_adapter_to_hal_adapter)
                 .collect()
         } else {
             high_performance_adapter
-                .into_iter()
                 .map(map_wgpu_adapter_to_hal_adapter)
                 .collect()
         }
@@ -189,11 +187,7 @@ impl hal::adapter::PhysicalDevice<Backend> for PhysicalDevice {
         todo!()
     }
 
-    fn capabilities(&self) -> hal::Capabilities {
-        todo!()
-    }
-
-    fn limits(&self) -> hal::Limits {
+    fn properties(&self) -> hal::PhysicalDeviceProperties {
         todo!()
     }
 }
@@ -218,6 +212,10 @@ impl hal::queue::QueueFamily for QueueFamily {
     fn id(&self) -> QueueFamilyId {
         WEBGPU_QUEUE_FAMILY_ID
     }
+
+    fn supports_sparse_binding(&self) -> bool {
+        false
+    }
 }
 
 use hal::pso::AllocationError;
@@ -226,25 +224,16 @@ use hal::pso::AllocationError;
 pub struct DescriptorPool;
 
 impl hal::pso::DescriptorPool<Backend> for DescriptorPool {
-    unsafe fn allocate_set(
+    unsafe fn allocate_one(
         &mut self,
         _layout: &<Backend as hal::Backend>::DescriptorSetLayout,
     ) -> Result<<Backend as hal::Backend>::DescriptorSet, AllocationError> {
         todo!()
     }
 
-    unsafe fn allocate<I, E>(&mut self, _layouts: I, _list: &mut E) -> Result<(), AllocationError>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<<Backend as hal::Backend>::DescriptorSetLayout>,
-        E: Extend<<Backend as hal::Backend>::DescriptorSet>,
-    {
-        todo!()
-    }
-
     unsafe fn free<I>(&mut self, _descriptor_sets: I)
     where
-        I: IntoIterator<Item = <Backend as hal::Backend>::DescriptorSet>,
+        I: Iterator<Item = <Backend as hal::Backend>::DescriptorSet>,
     {
         todo!()
     }

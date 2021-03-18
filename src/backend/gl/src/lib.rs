@@ -27,7 +27,9 @@ extern crate log;
 
 use std::{
     cell::Cell,
+    collections::HashMap,
     fmt,
+    hash::BuildHasherDefault,
     ops::{Deref, Range},
     sync::{Arc, Weak},
     thread,
@@ -59,6 +61,7 @@ pub use glow::Context as GlContext;
 use glow::HasContext;
 
 type ColorSlot = u8;
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<fxhash::FxHasher>>;
 
 // we can support more samplers if not every one of them is used at a time,
 // but it probably doesn't worth it.
@@ -89,7 +92,7 @@ impl hal::Backend for Backend {
     type Surface = Surface;
 
     type QueueFamily = QueueFamily;
-    type CommandQueue = queue::CommandQueue;
+    type Queue = queue::Queue;
     type CommandBuffer = command::CommandBuffer;
 
     type Memory = native::Memory;
@@ -203,8 +206,7 @@ struct Share {
     info: Info,
     supported_features: hal::Features,
     legacy_features: info::LegacyFeatures,
-    limits: hal::Limits,
-    public_caps: hal::Capabilities,
+    public_caps: hal::PhysicalDeviceProperties,
     private_caps: info::PrivateCaps,
     // Indicates if there is an active logical device.
     open: Cell<bool>,
@@ -354,7 +356,7 @@ impl PhysicalDevice {
     fn new_adapter(context: GlContext) -> adapter::Adapter<Backend> {
         let gl = GlContainer { context };
         // query information
-        let (info, supported_features, legacy_features, limits, public_caps, private_caps) =
+        let (info, supported_features, legacy_features, public_caps, private_caps) =
             info::query_all(&gl);
         info!("Vendor: {:?}", info.platform_name.vendor);
         info!("Renderer: {:?}", info.platform_name.renderer);
@@ -432,7 +434,6 @@ impl PhysicalDevice {
             info,
             supported_features,
             legacy_features,
-            limits,
             public_caps,
             private_caps,
             open: Cell::new(false),
@@ -543,6 +544,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         let gl = &self.0.context;
 
         if cfg!(debug_assertions) && !cfg!(target_arch = "wasm32") && gl.supports_debug() {
+            info!("Debug output is enabled");
             gl.enable(glow::DEBUG_OUTPUT);
             gl.debug_message_callback(debug_message_callback);
         }
@@ -551,7 +553,9 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             .0
             .legacy_features
             .contains(info::LegacyFeatures::SRGB_COLOR)
+            && !self.0.info.version.is_embedded
         {
+            // `FRAMEBUFFER_SRGB` is enabled by default on embedded targets.
             // TODO: Find way to emulate this on older Opengl versions.
             gl.enable(glow::FRAMEBUFFER_SRGB);
         }
@@ -572,11 +576,11 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         Ok(adapter::Gpu {
             device: Device::new(self.0.clone(), requested_features),
             queue_groups: families
-                .into_iter()
+                .iter()
                 .map(|&(_family, priorities)| {
                     assert_eq!(priorities.len(), 1);
                     let mut family = q::QueueGroup::new(q::QueueFamilyId(0));
-                    let queue = queue::CommandQueue::new(&self.0, requested_features, vao);
+                    let queue = queue::Queue::new(&self.0, requested_features, vao);
                     family.add_queue(queue);
                     family
                 })
@@ -642,12 +646,8 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         self.0.supported_features
     }
 
-    fn capabilities(&self) -> hal::Capabilities {
+    fn properties(&self) -> hal::PhysicalDeviceProperties {
         self.0.public_caps
-    }
-
-    fn limits(&self) -> hal::Limits {
-        self.0.limits
     }
 }
 
@@ -664,6 +664,9 @@ impl q::QueueFamily for QueueFamily {
     fn id(&self) -> q::QueueFamilyId {
         q::QueueFamilyId(0)
     }
+    fn supports_sparse_binding(&self) -> bool {
+        false
+    }
 }
 
 fn resolve_sub_range(
@@ -672,4 +675,8 @@ fn resolve_sub_range(
 ) -> Range<buffer::Offset> {
     let end = sub.size.map_or(whole.end, |s| whole.start + sub.offset + s);
     whole.start + sub.offset..end
+}
+
+const fn is_webgl() -> bool {
+    cfg!(target_arch = "wasm32")
 }

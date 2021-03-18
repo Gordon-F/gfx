@@ -1,14 +1,14 @@
 use crate::{Error, GlContainer, MAX_COLOR_ATTACHMENTS};
 use glow::HasContext;
-use hal::{Capabilities, DynamicStates, Features, Limits, PerformanceCaveats};
+use hal::{DynamicStates, Features, Limits, PerformanceCaveats, PhysicalDeviceProperties};
 use std::{collections::HashSet, fmt, str};
 
 /// A version number for a specific component of an OpenGL implementation
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Version {
-    pub is_embedded: bool,
     pub major: u32,
     pub minor: u32,
+    pub is_embedded: bool,
     pub revision: Option<u32>,
     pub vendor_info: String,
 }
@@ -17,9 +17,9 @@ impl Version {
     /// Create a new OpenGL version number
     pub fn new(major: u32, minor: u32, revision: Option<u32>, vendor_info: String) -> Self {
         Version {
-            is_embedded: false,
             major: major,
             minor: minor,
+            is_embedded: false,
             revision: revision,
             vendor_info,
         }
@@ -27,9 +27,9 @@ impl Version {
     /// Create a new OpenGL ES version number
     pub fn new_embedded(major: u32, minor: u32, vendor_info: String) -> Self {
         Version {
-            is_embedded: true,
             major,
             minor,
+            is_embedded: true,
             revision: None,
             vendor_info,
         }
@@ -55,28 +55,38 @@ impl Version {
     /// Note that this function is intentionally lenient in regards to parsing,
     /// and will try to recover at least the first two version numbers without
     /// resulting in an `Err`.
+    /// # Notes
+    /// `WebGL 2` version returned as `OpenGL ES 3.0`
     pub fn parse(mut src: &str) -> Result<Version, &str> {
-        // TODO: Parse version and optional vendor
         let webgl_sig = "WebGL ";
-        let is_webgl = src.contains(webgl_sig);
-        if is_webgl {
-            return Ok(Version {
-                is_embedded: true,
-                major: 2,
-                minor: 0,
-                revision: None,
-                vendor_info: "".to_string(),
-            });
-        }
+        // According to the WebGL specification
+        // VERSION	WebGL<space>1.0<space><vendor-specific information>
+        // SHADING_LANGUAGE_VERSION	WebGL<space>GLSL<space>ES<space>1.0<space><vendor-specific information>
+        let is_webgl = src.starts_with(webgl_sig);
+        let is_es = if is_webgl {
+            let pos = src.rfind(webgl_sig).unwrap_or(0);
+            src = &src[pos + webgl_sig.len()..];
+            true
+        } else {
+            let es_sig = " ES ";
+            match src.rfind(es_sig) {
+                Some(pos) => {
+                    src = &src[pos + es_sig.len()..];
+                    true
+                }
+                None => false,
+            }
+        };
 
-        let es_sig = " ES ";
-        let is_es = match src.rfind(es_sig) {
+        let glsl_es_sig = "GLSL ES ";
+        let is_glsl = match src.find(glsl_es_sig) {
             Some(pos) => {
-                src = &src[pos + es_sig.len()..];
+                src = &src[pos + glsl_es_sig.len()..];
                 true
             }
             None => false,
         };
+
         let (version, vendor_info) = match src.find(' ') {
             Some(i) => (&src[..i], src[i + 1..].to_string()),
             None => (src, String::new()),
@@ -94,13 +104,22 @@ impl Version {
             };
             trimmed.parse().ok()
         });
-        let revision = it.next().and_then(|s| s.parse().ok());
+        let revision = if is_webgl {
+            None
+        } else {
+            it.next().and_then(|s| s.parse().ok())
+        };
 
         match (major, minor, revision) {
             (Some(major), Some(minor), revision) => Ok(Version {
-                is_embedded: is_es,
-                major,
+                // Return WebGL 2.0 version as OpenGL ES 3.0
+                major: if is_webgl && !is_glsl {
+                    major + 1
+                } else {
+                    major
+                },
                 minor,
+                is_embedded: is_es,
                 revision,
                 vendor_info,
             }),
@@ -167,8 +186,8 @@ pub struct PlatformName {
 impl PlatformName {
     fn get(gl: &GlContainer) -> Self {
         PlatformName {
-            vendor: get_string(gl, glow::VENDOR).unwrap(),
-            renderer: get_string(gl, glow::RENDERER).unwrap(),
+            vendor: get_string(gl, glow::VENDOR).unwrap_or_default(),
+            renderer: get_string(gl, glow::RENDERER).unwrap_or_default(),
         }
     }
 }
@@ -206,6 +225,10 @@ pub struct PrivateCaps {
     pub draw_buffers: bool,
     /// Whether separate color masks per output buffer are supported.
     pub per_slot_color_mask: bool,
+    /// Reading from textures into CPU memory is supported.
+    pub get_tex_image: bool,
+    /// Inserting memory barriers.
+    pub memory_barrier: bool,
 }
 
 /// OpenGL implementation information
@@ -263,26 +286,24 @@ pub enum Requirement<'a> {
     Ext(&'a str),
 }
 
-const IS_WEBGL: bool = cfg!(target_arch = "wasm32");
-
 impl Info {
     fn get(gl: &GlContainer) -> Info {
         let platform_name = PlatformName::get(gl);
         let raw_version = get_string(gl, glow::VERSION).unwrap_or_default();
         let version = Version::parse(&raw_version).unwrap();
-        let raw_shader_version;
-        let shading_language = if IS_WEBGL {
-            Version::new_embedded(3, 0, String::from(""))
-        } else {
-            raw_shader_version = get_string(gl, glow::SHADING_LANGUAGE_VERSION).unwrap_or_default();
+        let shading_language = {
+            let raw_shader_version =
+                get_string(gl, glow::SHADING_LANGUAGE_VERSION).unwrap_or_default();
             Version::parse(&raw_shader_version).unwrap()
         };
 
         // TODO: Use separate path for WebGL extensions in `glow` somehow
         // Perhaps automatic fallback for NUM_EXTENSIONS to EXTENSIONS on native
-        let extensions = if IS_WEBGL {
+        let extensions = if crate::is_webgl() {
             HashSet::new()
-        } else if version >= Version::new(3, 0, None, String::from("")) {
+        } else if (version >= Version::new(3, 0, None, String::from("")))
+            || (version >= Version::new_embedded(3, 0, String::from("")))
+        {
             let num_exts = get_usize(gl, glow::NUM_EXTENSIONS).unwrap();
             (0..num_exts)
                 .map(|i| unsafe { gl.get_parameter_indexed_string(glow::EXTENSIONS, i as u32) })
@@ -311,7 +332,7 @@ impl Info {
 
     pub fn is_embedded_version_supported(&self, major: u32, minor: u32) -> bool {
         self.version.is_embedded
-            && self.version >= Version::new(major, minor, None, String::from(""))
+            && self.version >= Version::new_embedded(major, minor, String::from(""))
     }
 
     /// Returns `true` if the implementation supports the extension
@@ -335,10 +356,6 @@ impl Info {
             Ext(extension) => self.is_extension_supported(extension),
         })
     }
-
-    pub fn is_webgl(&self) -> bool {
-        IS_WEBGL
-    }
 }
 
 /// Load the information pertaining to the driver and the corresponding device
@@ -349,8 +366,7 @@ pub(crate) fn query_all(
     Info,
     Features,
     LegacyFeatures,
-    Limits,
-    Capabilities,
+    PhysicalDeviceProperties,
     PrivateCaps,
 ) {
     use self::Requirement::*;
@@ -358,12 +374,12 @@ pub(crate) fn query_all(
     let max_texture_size = get_usize(gl, glow::MAX_TEXTURE_SIZE).unwrap_or(64) as u32;
     let max_samples = get_usize(gl, glow::MAX_SAMPLES).unwrap_or(8);
     let max_samples_mask = (max_samples * 2 - 1) as u8;
-    let max_texel_elements = if IS_WEBGL {
+    let max_texel_elements = if crate::is_webgl() {
         0
     } else {
         get_usize(gl, glow::MAX_TEXTURE_BUFFER_SIZE).unwrap_or(0)
     };
-    let min_storage_buffer_offset_alignment = if IS_WEBGL {
+    let min_storage_buffer_offset_alignment = if crate::is_webgl() {
         256
     } else {
         get_u64(gl, glow::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT).unwrap_or(256)
@@ -399,7 +415,10 @@ pub(crate) fn query_all(
         limits.max_viewports = get_usize(gl, glow::MAX_VIEWPORTS).unwrap_or(0);
     }
 
-    if info.is_supported(&[Core(4, 3), Ext("GL_ARB_compute_shader")]) {
+    //TODO: technically compute is exposed in Es(3, 1), but GLES requires 3.2
+    // for any storage buffers. We need to investigate if this requirement
+    // can be lowered.
+    if info.is_supported(&[Core(4, 3), Es(3, 2), Ext("GL_ARB_compute_shader")]) {
         for (i, (count, size)) in limits
             .max_compute_work_group_count
             .iter_mut()
@@ -425,8 +444,7 @@ pub(crate) fn query_all(
     ]) {
         features |= Features::SAMPLER_ANISOTROPY;
     }
-    if info.is_supported(&[Core(4, 2)]) {
-    //if info.is_supported(&[Core(4, 2), Es(3, 1), Ext("GL_ARB_shading_language_420pack")]) {
+    if info.is_supported(&[Core(4, 2), Es(3, 1)]) {
         legacy |= LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER;
     }
     if info.is_supported(&[Core(3, 3), Es(3, 0), Ext("GL_ARB_instanced_arrays")]) {
@@ -442,7 +460,8 @@ pub(crate) fn query_all(
     if info.is_supported(&[Core(4, 4), Ext("ARB_texture_mirror_clamp_to_edge")]) {
         features |= Features::SAMPLER_MIRROR_CLAMP_EDGE;
     }
-    if info.is_supported(&[Core(4, 0), Es(3, 2), Ext("GL_EXT_draw_buffers2")]) && !info.is_webgl() {
+    if info.is_supported(&[Core(4, 0), Es(3, 2), Ext("GL_EXT_draw_buffers2")]) && !crate::is_webgl()
+    {
         features |= Features::INDEPENDENT_BLENDING;
     }
 
@@ -476,7 +495,12 @@ pub(crate) fn query_all(
     ]) {
         legacy |= LegacyFeatures::VERTEX_BASE;
     }
-    if info.is_supported(&[Core(3, 2), Ext("GL_ARB_framebuffer_sRGB")]) {
+    if info.is_supported(&[
+        Core(3, 1),
+        Es(3, 0),
+        Ext("GL_ARB_framebuffer_sRGB"),
+        Ext("GL_EXT_sRGB"),
+    ]) {
         legacy |= LegacyFeatures::SRGB_COLOR;
     }
     if info.is_supported(&[Core(3, 1), Es(3, 0), Ext("GL_ARB_uniform_buffer_object")]) {
@@ -506,9 +530,11 @@ pub(crate) fn query_all(
     if !info.is_supported(&[Core(4, 2)]) {
         performance_caveats |= PerformanceCaveats::BASE_VERTEX_INSTANCE_DRAWING;
     }
-    let capabilities = Capabilities {
+    let properties = PhysicalDeviceProperties {
+        limits,
         performance_caveats,
         dynamic_pipeline_states: DynamicStates::all(),
+        ..PhysicalDeviceProperties::default()
     };
 
     let buffer_storage = info.is_supported(&[
@@ -517,7 +543,7 @@ pub(crate) fn query_all(
         Ext("GL_EXT_buffer_storage"),
     ]);
     // See https://github.com/gfx-rs/gfx/issues/3453
-    let emulate_map = IS_WEBGL || !buffer_storage;
+    let emulate_map = crate::is_webgl() || !buffer_storage;
 
     let private = PrivateCaps {
         vertex_array: info.is_supported(&[Core(3, 0), Es(3, 0), Ext("GL_ARB_vertex_array_object")]),
@@ -525,20 +551,22 @@ pub(crate) fn query_all(
         framebuffer: info.is_supported(&[Core(3, 0), Es(2, 0), Ext("GL_ARB_framebuffer_object")]),
         // TODO && gl.GenFramebuffers.is_loaded(),
         framebuffer_texture: info.is_supported(&[Core(3, 0)]), //TODO: double check
-        index_buffer_role_change: !info.is_webgl(),
+        index_buffer_role_change: info.is_supported(&[Core(2, 0), Es(2, 0)]),
         image_storage: info.is_supported(&[Core(4, 2), Ext("GL_ARB_texture_storage")]),
         buffer_storage,
         clear_buffer: info.is_supported(&[Core(3, 0), Es(3, 0)]),
         program_interface: info.is_supported(&[Core(4, 3), Ext("GL_ARB_program_interface_query")]),
         frag_data_location: !info.version.is_embedded,
-        sync: !info.is_webgl() && info.is_supported(&[Core(3, 2), Es(3, 0), Ext("GL_ARB_sync")]), // TODO
+        sync: info.is_supported(&[Core(3, 2), Es(3, 0), Ext("GL_ARB_sync")]), // TODO
         emulate_map,
         depth_range_f64_precision: !info.version.is_embedded, // TODO
         draw_buffers: info.is_supported(&[Core(2, 0), Es(3, 0)]),
-        per_slot_color_mask: info.is_supported(&[Core(3, 0)])
+        per_slot_color_mask: info.is_supported(&[Core(3, 0)]),
+        get_tex_image: !info.version.is_embedded,
+        memory_barrier: info.is_supported(&[Core(4, 2), Es(3, 1)]),
     };
 
-    (info, features, legacy, limits, capabilities, private)
+    (info, features, legacy, properties, private)
 }
 
 #[cfg(test)]
@@ -594,6 +622,23 @@ mod tests {
         assert_eq!(
             Version::parse("OpenGL ES GLSL ES 3.20"),
             Ok(Version::new_embedded(3, 2, String::new()))
+        );
+        assert_eq!(
+            // WebGL 2.0 should parse as OpenGL ES 3.0
+            Version::parse("WebGL 2.0 (OpenGL ES 3.0 Chromium)"),
+            Ok(Version::new_embedded(
+                3,
+                0,
+                "(OpenGL ES 3.0 Chromium)".to_string()
+            ))
+        );
+        assert_eq!(
+            Version::parse("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)"),
+            Ok(Version::new_embedded(
+                3,
+                0,
+                "(OpenGL ES GLSL ES 3.0 Chromium)".to_string()
+            ))
         );
     }
 }

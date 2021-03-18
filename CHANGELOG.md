@@ -1,6 +1,14 @@
 # Change Log
 
-### hal-unreleased
+### unreleased
+  - the new "bench" example is added
+  - timestamp period query is moved to the `Queue`
+  - `DescriptorLimits` is added to consolidate descriptor-related limits and its fields changed from `usize` to `u32`
+  - `Limits` and `Capabilities` structures merged together as `PhysicalDeviceProperties`
+  - Entries for Mesh Shading and Descriptor Indexing added to `PhysicalDeviceProperties`
+
+## hal-0.7.0 (30-01-2021)
+  - `Borrow` and `ExactSizeIterator` bounds are removed from the iterators
   - error improvements:
     - use `thiserror` for errors
     - variants and a few names are refactored
@@ -20,15 +28,17 @@
   - debug names are supported for all objectr
   - other API changes:
     - `bind_index_buffer` now doesn't need a separate structure
+    - plural versions of `reset_fence` and `create_xx_pipeline` are removed
     - swapchain images can be used for transfer operations
     - separate feature for comparison mutable samplers
     - pipeline descriptor vectors are replaced with slices
+    - features for non-normalized mutable samplers
+    - `Capabilities` structure with supported dynamic state flags
   - OpenGL backend improvements:
     - finally has the API fully matching gfx-hal
     - now only uses OpenGL ES on Linux/Android/Web targets
     - binding model has been completely rewritten
     - various number of fixed in rendering, memory mapping, and other areas
-
 
 ### backend-dx12-unreleased
   - fix SPIR-V entry point selection

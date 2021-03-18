@@ -5,9 +5,8 @@ use crate::{
 
 use arrayvec::ArrayVec;
 use glow::HasContext;
-use smallvec::SmallVec;
 
-use std::{borrow::Borrow, mem, slice};
+use std::{mem, slice};
 
 // State caching system for command queue.
 //
@@ -54,25 +53,43 @@ impl State {
 }
 
 #[derive(Debug)]
-pub struct CommandQueue {
+pub struct Queue {
     pub(crate) share: Starc<Share>,
     features: hal::Features,
     vao: Option<native::VertexArray>,
     state: State,
+    fill_buffer: native::RawBuffer,
+    fill_data: Box<[u32]>,
 }
 
-impl CommandQueue {
+const FILL_DATA_WORDS: usize = 16 << 10;
+
+impl Queue {
     /// Create a new command queue.
     pub(crate) fn new(
         share: &Starc<Share>,
         features: hal::Features,
         vao: Option<native::VertexArray>,
     ) -> Self {
-        CommandQueue {
+        let gl = &share.context;
+        let fill_buffer = unsafe {
+            let buffer = gl.create_buffer().unwrap();
+            gl.bind_buffer(glow::COPY_READ_BUFFER, Some(buffer));
+            gl.buffer_data_size(
+                glow::COPY_READ_BUFFER,
+                FILL_DATA_WORDS as i32 * 4,
+                glow::STREAM_DRAW,
+            );
+            gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+            buffer
+        };
+        Queue {
             share: share.clone(),
             features,
             vao,
             state: State::new(),
+            fill_buffer,
+            fill_data: vec![0; FILL_DATA_WORDS].into_boxed_slice(),
         }
     }
 
@@ -205,34 +222,12 @@ impl CommandQueue {
         unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None) };
         self.state.index_buffer = None;
 
-        // Reset viewports
-        if self.state.num_viewports == 1 {
-            unsafe {
-                gl.viewport(0, 0, 0, 0);
-                gl.depth_range_f32(0.0, 1.0);
-            };
-        } else if self.state.num_viewports > 1 {
-            // 16 viewports is a common limit set in drivers.
-            let viewports: SmallVec<[[f32; 4]; 16]> = (0..self.state.num_viewports)
-                .map(|_| [0.0, 0.0, 0.0, 0.0])
-                .collect();
-            let depth_ranges: SmallVec<[[f64; 2]; 16]> =
-                (0..self.state.num_viewports).map(|_| [0.0, 0.0]).collect();
-            unsafe {
-                gl.viewport_f32_slice(0, viewports.len() as i32, &viewports);
-                gl.depth_range_f64_slice(0, depth_ranges.len() as i32, &depth_ranges);
-            }
-        }
-
-        // Reset scissors
-        if self.state.num_scissors == 1 {
-            unsafe { gl.scissor(0, 0, 0, 0) };
-        } else if self.state.num_scissors > 1 {
-            // 16 viewports is a common limit set in drivers.
-            let scissors: SmallVec<[[i32; 4]; 16]> =
-                (0..self.state.num_scissors).map(|_| [0, 0, 0, 0]).collect();
-            unsafe { gl.scissor_slice(0, scissors.len() as i32, scissors.as_slice()) };
-        }
+        // Reset viewports && scissors
+        unsafe {
+            gl.viewport(0, 0, 0, 0);
+            gl.depth_range_f32(0.0, 1.0);
+            gl.scissor(0, 0, 0, 0);
+        };
     }
 
     fn process(&mut self, cmd: &com::Command, data_buf: &[u8]) {
@@ -399,7 +394,10 @@ impl CommandQueue {
 
                 let num_viewports = viewports.len();
                 assert_eq!(num_viewports, depth_ranges.len());
-                assert!(0 < num_viewports && num_viewports <= self.share.limits.max_viewports);
+                assert!(
+                    0 < num_viewports
+                        && num_viewports <= self.share.public_caps.limits.max_viewports
+                );
 
                 if num_viewports == 1 {
                     let view = viewports[0];
@@ -435,7 +433,9 @@ impl CommandQueue {
                 let gl = &self.share.context;
                 let scissors = Self::get::<[i32; 4]>(data_buf, data_ptr);
                 let num_scissors = scissors.len();
-                assert!(0 < num_scissors && num_scissors <= self.share.limits.max_viewports);
+                assert!(
+                    0 < num_scissors && num_scissors <= self.share.public_caps.limits.max_viewports
+                );
 
                 if num_scissors == 1 {
                     let scissor = scissors[0];
@@ -503,6 +503,43 @@ impl CommandQueue {
                         glow::DEPTH_STENCIL_ATTACHMENT
                     };
                     self.bind_target(target, attachment, view);
+                }
+            }
+            com::Command::FillBuffer(buffer, ref range, value) => {
+                //Note: buffers with `DYNAMIC_STORAGE_BIT` can't be uploaded to directly.
+                // And we expect the target buffers to be on GPU, where we assign this flag.
+
+                let total_size = (range.end - range.start) as i32;
+                let temp_size = (total_size as usize / 4).min(FILL_DATA_WORDS);
+                let mut dst_offset = range.start as i32;
+                for v in self.fill_data[..temp_size].iter_mut() {
+                    *v = value;
+                }
+
+                let gl = &self.share.context;
+                unsafe {
+                    gl.bind_buffer(glow::COPY_READ_BUFFER, Some(self.fill_buffer));
+                    gl.buffer_sub_data_u8_slice(
+                        glow::COPY_READ_BUFFER,
+                        0,
+                        slice::from_raw_parts(self.fill_data.as_ptr() as *const u8, temp_size * 4),
+                    );
+                    gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(buffer));
+
+                    while dst_offset < range.end as i32 {
+                        let copy_size = (temp_size as i32 * 4).min(range.end as i32 - dst_offset);
+                        gl.copy_buffer_sub_data(
+                            glow::COPY_READ_BUFFER,
+                            glow::COPY_WRITE_BUFFER,
+                            0,
+                            dst_offset,
+                            copy_size,
+                        );
+                        dst_offset += copy_size;
+                    }
+
+                    gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+                    gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
                 }
             }
             com::Command::SetDrawColorBuffers(ref indices) => {
@@ -647,7 +684,7 @@ impl CommandQueue {
                 gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
             },
             com::Command::CopyBufferToRenderbuffer(..) => {
-                unimplemented!() //TODO: use FBO
+                error!("CopyBufferToRenderbuffer is not implemented");
             }
             com::Command::CopyTextureToBuffer {
                 src_texture,
@@ -656,33 +693,42 @@ impl CommandQueue {
                 pixel_type,
                 dst_buffer,
                 ref data,
-            } => unsafe {
-                // TODO: Fix active texture
-                // TODO: handle partial copies gracefully
-                assert_eq!(data.image_offset, hal::image::Offset { x: 0, y: 0, z: 0 });
-                assert_eq!(texture_target, glow::TEXTURE_2D);
-                let gl = &self.share.context;
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(dst_buffer));
-                gl.bind_texture(glow::TEXTURE_2D, Some(src_texture));
-                gl.get_tex_image(
-                    glow::TEXTURE_2D,
-                    data.image_layers.level as _,
-                    //data.image_offset.x,
-                    //data.image_offset.y,
-                    //data.image_extent.width as _,
-                    //data.image_extent.height as _,
-                    texture_format,
-                    pixel_type,
-                    glow::PixelPackData::BufferOffset(data.buffer_offset as u32),
-                );
-                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-            },
+            } => {
+                if self.share.private_caps.get_tex_image {
+                    // TODO: Fix active texture
+                    // TODO: handle partial copies gracefully
+                    assert_eq!(data.image_offset, hal::image::Offset { x: 0, y: 0, z: 0 });
+                    assert_eq!(texture_target, glow::TEXTURE_2D);
+                    let gl = &self.share.context;
+                    unsafe {
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(dst_buffer));
+                        gl.bind_texture(glow::TEXTURE_2D, Some(src_texture));
+                        gl.get_tex_image(
+                            glow::TEXTURE_2D,
+                            data.image_layers.level as _,
+                            //data.image_offset.x,
+                            //data.image_offset.y,
+                            //data.image_extent.width as _,
+                            //data.image_extent.height as _,
+                            texture_format,
+                            pixel_type,
+                            glow::PixelPackData::BufferOffset(data.buffer_offset as u32),
+                        );
+                        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                    }
+                } else {
+                    //TODO: use FBO
+                    error!("CopyTextureToBuffer is not implemented on GLES");
+                }
+            }
             com::Command::CopyRenderbufferToBuffer(..) => {
-                unimplemented!() //TODO: use FBO
+                //TODO: use FBO
+                error!("CopyRenderbufferToBuffer is not implemented");
             }
             com::Command::CopyImageToTexture(..) => {
-                unimplemented!() //TODO: use FBO
+                //TODO: use FBO
+                error!("CopyImageToTexture is not implemented");
             }
             com::Command::CopyImageToRenderbuffer {
                 src_image,
@@ -941,7 +987,7 @@ impl CommandQueue {
                     _ => unsafe { gl.disable(gl_offset) },
                 }
 
-                if !self.share.info.is_webgl() && !self.share.info.version.is_embedded {
+                if !self.share.info.version.is_embedded {
                     match false {
                         //TODO
                         true => unsafe { gl.enable(glow::MULTISAMPLE) },
@@ -988,8 +1034,8 @@ impl CommandQueue {
                     );
                 } else {
                     if slot.is_some() {
-                        /// TODO: the generator of these commands should coalesce identical masks to prevent this warning
-                        ///       as much as is possible.
+                        // TODO: the generator of these commands should coalesce identical masks to prevent this warning
+                        //       as much as is possible.
                         warn!("GLES and WebGL do not support per-target color masks. Falling back on global mask.");
                     }
                     self.share.context.color_mask(
@@ -1013,59 +1059,14 @@ impl CommandQueue {
                 self.share
                     .context
                     .stencil_mask_separate(glow::BACK, values.back);
-            }, /*
-               com::Command::SetRasterizer(rast) => {
-                   state::bind_rasterizer(&self.share.context, &rast, self.share.info.version.is_embedded);
-               },
-               com::Command::SetDepthState(depth) => {
-                   state::bind_depth(&self.share.context, &depth);
-               },
-               com::Command::SetStencilState(stencil, refs, cull) => {
-                   state::bind_stencil(&self.share.context, &stencil, refs, cull);
-               },
-               com::Command::SetBlendState(slot, color) => {
-                   if self.share.capabilities.separate_blending_slots {
-                       state::bind_blend_slot(&self.share.context, slot, color);
-                   }else if slot == 0 {
-                       //self.temp.color = color; //TODO
-                       state::bind_blend(&self.share.context, color);
-                   }else if false {
-                       error!("Separate blending slots are not supported");
-                   }
-               },
-               com::Command::CopyBuffer(src, dst, src_offset, dst_offset, size) => {
-                   let gl = &self.share.context;
-
-                   if self.share.capabilities.copy_buffer {
-                       unsafe {
-                           gl.BindBuffer(gl::COPY_READ_BUFFER, src);
-                           gl.BindBuffer(gl::COPY_WRITE_BUFFER, dst);
-                           gl.CopyBufferSubData(gl::COPY_READ_BUFFER,
-                                               gl::COPY_WRITE_BUFFER,
-                                               src_offset,
-                                               dst_offset,
-                                               size);
-                       }
-                   } else {
-                       debug_assert!(self.share.private_caps.buffer_storage == false);
-
-                       unsafe {
-                           let mut src_ptr = 0 as *mut ::std::os::raw::c_void;
-                           device::temporary_ensure_mapped(&mut src_ptr, gl::COPY_READ_BUFFER, src, memory::READ, gl);
-                           src_ptr.offset(src_offset);
-
-                           let mut dst_ptr = 0 as *mut ::std::os::raw::c_void;
-                           device::temporary_ensure_mapped(&mut dst_ptr, gl::COPY_WRITE_BUFFER, dst, memory::WRITE, gl);
-                           dst_ptr.offset(dst_offset);
-
-                           ::std::ptr::copy(src_ptr, dst_ptr, size as usize);
-
-                           device::temporary_ensure_unmapped(&mut src_ptr, gl::COPY_READ_BUFFER, src, gl);
-                           device::temporary_ensure_unmapped(&mut dst_ptr, gl::COPY_WRITE_BUFFER, dst, gl);
-                       }
-                   }
-               },
-               */
+            },
+            com::Command::MemoryBarrier(mask) => {
+                if self.share.private_caps.memory_barrier {
+                    unsafe {
+                        self.share.context.memory_barrier(mask);
+                    }
+                }
+            }
         }
         if let Err(err) = self.share.check() {
             panic!("Error {:?} executing command: {:?}", err, cmd)
@@ -1073,22 +1074,22 @@ impl CommandQueue {
     }
 }
 
-impl hal::queue::CommandQueue<Backend> for CommandQueue {
-    unsafe fn submit<'a, T, Ic, S, Iw, Is>(
+impl hal::queue::Queue<Backend> for Queue {
+    unsafe fn submit<'a, Ic, Iw, Is>(
         &mut self,
-        submit_info: hal::queue::Submission<Ic, Iw, Is>,
+        command_buffers: Ic,
+        _wait_semaphores: Iw,
+        _signal_semaphores: Is,
         fence: Option<&mut native::Fence>,
     ) where
-        T: 'a + Borrow<com::CommandBuffer>,
-        Ic: IntoIterator<Item = &'a T>,
-        S: 'a + Borrow<native::Semaphore>,
-        Iw: IntoIterator<Item = (&'a S, hal::pso::PipelineStage)>,
-        Is: IntoIterator<Item = &'a S>,
+        Ic: Iterator<Item = &'a com::CommandBuffer>,
+        Iw: Iterator<Item = (&'a native::Semaphore, hal::pso::PipelineStage)>,
+        Is: Iterator<Item = &'a native::Semaphore>,
     {
         use crate::pool::BufferMemory;
         {
-            for buf in submit_info.command_buffers {
-                let cb = &buf.borrow().data;
+            for cmd_buf in command_buffers {
+                let cb = &cmd_buf.data;
                 let memory = cb
                     .memory
                     .try_lock()
@@ -1138,5 +1139,9 @@ impl hal::queue::CommandQueue<Backend> for CommandQueue {
             self.share.context.finish();
         }
         Ok(())
+    }
+
+    fn timestamp_period(&self) -> f32 {
+        1.0
     }
 }

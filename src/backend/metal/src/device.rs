@@ -1,12 +1,12 @@
+#[cfg(feature = "cross")]
+use crate::internal::FastStorageMap;
 use crate::{
-    command, conversions as conv,
-    internal::{Channel, FastStorageMap},
-    native as n, AsNative, Backend, OnlineRecording, QueueFamily, ResourceIndex, Shared,
-    VisibilityShared, MAX_BOUND_DESCRIPTOR_SETS, MAX_COLOR_ATTACHMENTS,
+    command, conversions as conv, internal::Channel, native as n, AsNative, Backend, FastHashMap,
+    OnlineRecording, QueueFamily, ResourceIndex, Shared, VisibilityShared,
+    MAX_BOUND_DESCRIPTOR_SETS, MAX_COLOR_ATTACHMENTS,
 };
 
 use arrayvec::ArrayVec;
-use auxil::{spirv_cross_specialize_ast, FastHashMap, ShaderStage};
 use cocoa_foundation::foundation::NSUInteger;
 use copyless::VecHelper;
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -30,14 +30,11 @@ use objc::{
     runtime::{Object, BOOL, NO},
 };
 use parking_lot::Mutex;
-use spirv_cross::{msl, spirv, ErrorCode as SpirvErrorCode};
 
+#[cfg(feature = "cross")]
+use std::collections::{hash_map::Entry, BTreeMap};
 use std::{
-    borrow::Borrow,
-    cmp,
-    collections::hash_map::Entry,
-    collections::BTreeMap,
-    iter, mem,
+    cmp, iter, mem,
     ops::Range,
     ptr,
     sync::{
@@ -47,10 +44,8 @@ use std::{
     thread, time,
 };
 
-const PUSH_CONSTANTS_DESC_SET: u32 = !0;
-const PUSH_CONSTANTS_DESC_BINDING: u32 = 0;
 const STRIDE_GRANULARITY: pso::ElemStride = 4; //TODO: work around?
-const SHADER_STAGE_COUNT: usize = 3;
+const SHADER_STAGE_COUNT: u32 = 3;
 
 #[derive(Clone, Debug)]
 enum FunctionError {
@@ -104,7 +99,7 @@ fn get_final_function(
             Some(c) => unsafe {
                 let ptr = &specialization.data[c.range.start as usize] as *const u8 as *const _;
                 let ty: metal::MTLDataType = msg_send![object, type];
-                constants.set_constant_value_at_index(c.id as NSUInteger, ty, ptr);
+                constants.set_constant_value_at_index(ptr, ty, c.id as NSUInteger);
             },
             None if required != NO => {
                 //TODO: get name
@@ -144,6 +139,9 @@ pub struct Device {
     memory_types: Vec<adapter::MemoryType>,
     features: hal::Features,
     pub online_recording: OnlineRecording,
+    pub always_prefer_naga: bool,
+    #[cfg(feature = "cross")]
+    spv_options: naga::back::spv::Options,
 }
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
@@ -281,8 +279,37 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         assert_eq!(families[0].1.len(), 1);
         let mut queue_group = QueueGroup::new(families[0].0.id());
         for _ in 0..self.shared.private_caps.exposed_queues {
-            queue_group.add_queue(command::CommandQueue::new(self.shared.clone()));
+            queue_group.add_queue(command::Queue::new(self.shared.clone()));
         }
+
+        #[cfg(feature = "cross")]
+        let spv_options = {
+            use naga::back::spv;
+            let capabilities = [
+                spv::Capability::Shader,
+                spv::Capability::Matrix,
+                spv::Capability::InputAttachment,
+                spv::Capability::Sampled1D,
+                spv::Capability::Image1D,
+                spv::Capability::SampledBuffer,
+                spv::Capability::ImageBuffer,
+                spv::Capability::ImageQuery,
+                spv::Capability::DerivativeControl,
+                //TODO: fill out the rest
+            ]
+            .iter()
+            .cloned()
+            .collect();
+            let mut flags = spv::WriterFlags::empty();
+            if cfg!(debug_assertions) {
+                flags |= spv::WriterFlags::DEBUG;
+            }
+            spv::Options {
+                lang_version: (1, 0),
+                flags,
+                capabilities,
+            }
+        };
 
         let device = Device {
             shared: self.shared.clone(),
@@ -290,6 +317,9 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             memory_types: self.memory_types.clone(),
             features: requested_features,
             online_recording: OnlineRecording::default(),
+            always_prefer_naga: false,
+            #[cfg(feature = "cross")]
+            spv_options,
         };
 
         Ok(adapter::Gpu {
@@ -418,7 +448,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             F::NON_FILL_POLYGON_MODE,
             self.shared.private_caps.expose_line_mode,
         );
-        if self.shared.private_caps.msl_version >= metal::MTLLanguageVersion::V2_0 {
+        if self.shared.private_caps.msl_version >= MTLLanguageVersion::V2_0 {
             features |= F::TEXTURE_DESCRIPTOR_ARRAY
                 | F::SHADER_SAMPLED_IMAGE_ARRAY_DYNAMIC_INDEXING
                 | F::SAMPLED_TEXTURE_DESCRIPTOR_INDEXING
@@ -438,110 +468,110 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         features
     }
 
-    fn capabilities(&self) -> hal::Capabilities {
+    fn properties(&self) -> hal::PhysicalDeviceProperties {
+        let pc = &self.shared.private_caps;
+        let device = self.shared.device.lock();
+
         let mut caveats = hal::PerformanceCaveats::empty();
         if !self.shared.private_caps.base_vertex_instance_drawing {
             caveats |= hal::PerformanceCaveats::BASE_VERTEX_INSTANCE_DRAWING;
         }
-        hal::Capabilities {
+        hal::PhysicalDeviceProperties {
+            limits: hal::Limits {
+                max_image_1d_size: pc.max_texture_size as _,
+                max_image_2d_size: pc.max_texture_size as _,
+                max_image_3d_size: pc.max_texture_3d_size as _,
+                max_image_cube_size: pc.max_texture_size as _,
+                max_image_array_layers: pc.max_texture_layers as _,
+                max_texel_elements: (pc.max_texture_size * pc.max_texture_size) as usize,
+                max_uniform_buffer_range: pc.max_buffer_size,
+                max_storage_buffer_range: pc.max_buffer_size,
+                // "Maximum length of an inlined constant data buffer, per graphics or compute function"
+                max_push_constants_size: 0x1000,
+                max_sampler_allocation_count: !0,
+                max_bound_descriptor_sets: MAX_BOUND_DESCRIPTOR_SETS as _,
+                descriptor_limits: hal::DescriptorLimits {
+                    max_per_stage_descriptor_samplers: pc.max_samplers_per_stage,
+                    max_per_stage_descriptor_uniform_buffers: pc.max_buffers_per_stage,
+                    max_per_stage_descriptor_storage_buffers: pc.max_buffers_per_stage,
+                    max_per_stage_descriptor_sampled_images: pc
+                        .max_textures_per_stage
+                        .min(pc.max_samplers_per_stage)
+                        as u32,
+                    max_per_stage_descriptor_storage_images: pc.max_textures_per_stage,
+                    max_per_stage_descriptor_input_attachments: pc.max_textures_per_stage, //TODO
+                    max_per_stage_resources: 0x100,                                        //TODO
+                    max_descriptor_set_samplers: pc.max_samplers_per_stage * SHADER_STAGE_COUNT,
+                    max_descriptor_set_uniform_buffers: pc.max_buffers_per_stage
+                        * SHADER_STAGE_COUNT,
+                    max_descriptor_set_uniform_buffers_dynamic: 8 * SHADER_STAGE_COUNT,
+                    max_descriptor_set_storage_buffers: pc.max_buffers_per_stage
+                        * SHADER_STAGE_COUNT,
+                    max_descriptor_set_storage_buffers_dynamic: 4 * SHADER_STAGE_COUNT,
+                    max_descriptor_set_sampled_images: pc
+                        .max_textures_per_stage
+                        .min(pc.max_samplers_per_stage)
+                        * SHADER_STAGE_COUNT,
+                    max_descriptor_set_storage_images: pc.max_textures_per_stage
+                        * SHADER_STAGE_COUNT,
+                    max_descriptor_set_input_attachments: pc.max_textures_per_stage
+                        * SHADER_STAGE_COUNT,
+                },
+                max_fragment_input_components: pc.max_fragment_input_components as usize,
+                max_framebuffer_layers: 2048, // TODO: Determine is this is the correct value
+                max_memory_allocation_count: 4096, // TODO: Determine is this is the correct value
+
+                max_patch_size: 0, // No tessellation
+
+                // Note: The maximum number of supported viewports and scissor rectangles varies by device.
+                // TODO: read from Metal Feature Sets.
+                max_viewports: 1,
+                max_viewport_dimensions: [pc.max_texture_size as _; 2],
+                max_framebuffer_extent: hal::image::Extent {
+                    //TODO
+                    width: pc.max_texture_size as _,
+                    height: pc.max_texture_size as _,
+                    depth: pc.max_texture_layers as _,
+                },
+                min_memory_map_alignment: 4,
+
+                optimal_buffer_copy_offset_alignment: pc.buffer_alignment,
+                optimal_buffer_copy_pitch_alignment: 4,
+                min_texel_buffer_offset_alignment: pc.buffer_alignment,
+                min_uniform_buffer_offset_alignment: pc.buffer_alignment,
+                min_storage_buffer_offset_alignment: pc.buffer_alignment,
+
+                max_compute_work_group_count: [!0; 3], // really undefined
+                max_compute_work_group_size: {
+                    let size = device.max_threads_per_threadgroup();
+                    [size.width as u32, size.height as u32, size.depth as u32]
+                },
+                max_compute_shared_memory_size: pc.max_total_threadgroup_memory as usize,
+
+                max_vertex_input_attributes: 31,
+                max_vertex_input_bindings: 31,
+                max_vertex_input_attribute_offset: 255, // TODO
+                max_vertex_input_binding_stride: 256,   // TODO
+                max_vertex_output_components: pc.max_fragment_input_components as usize,
+
+                framebuffer_color_sample_counts: 0b101, // TODO
+                framebuffer_depth_sample_counts: 0b101, // TODO
+                framebuffer_stencil_sample_counts: 0b101, // TODO
+                max_color_attachments: pc.max_color_render_targets as usize,
+
+                buffer_image_granularity: 1,
+                // Note: we issue Metal buffer-to-buffer copies on memory flush/invalidate,
+                // and those need to operate on sizes being multiples of 4.
+                non_coherent_atom_size: 4,
+                max_sampler_anisotropy: 16.,
+                min_vertex_input_binding_stride_alignment: STRIDE_GRANULARITY as u64,
+
+                ..hal::Limits::default() // TODO!
+            },
             performance_caveats: caveats,
             dynamic_pipeline_states: hal::DynamicStates::all(),
-        }
-    }
 
-    fn limits(&self) -> hal::Limits {
-        let pc = &self.shared.private_caps;
-        let device = self.shared.device.lock();
-        hal::Limits {
-            max_image_1d_size: pc.max_texture_size as _,
-            max_image_2d_size: pc.max_texture_size as _,
-            max_image_3d_size: pc.max_texture_3d_size as _,
-            max_image_cube_size: pc.max_texture_size as _,
-            max_image_array_layers: pc.max_texture_layers as _,
-            max_texel_elements: (pc.max_texture_size * pc.max_texture_size) as usize,
-            max_uniform_buffer_range: pc.max_buffer_size,
-            max_storage_buffer_range: pc.max_buffer_size,
-            // "Maximum length of an inlined constant data buffer, per graphics or compute function"
-            max_push_constants_size: 0x1000,
-            max_sampler_allocation_count: !0,
-            max_bound_descriptor_sets: MAX_BOUND_DESCRIPTOR_SETS as _,
-            max_descriptor_set_samplers: pc.max_samplers_per_stage as usize * SHADER_STAGE_COUNT,
-            max_descriptor_set_uniform_buffers: pc.max_buffers_per_stage as usize
-                * SHADER_STAGE_COUNT,
-            max_descriptor_set_uniform_buffers_dynamic: 8 * SHADER_STAGE_COUNT,
-            max_descriptor_set_storage_buffers: pc.max_buffers_per_stage as usize
-                * SHADER_STAGE_COUNT,
-            max_descriptor_set_storage_buffers_dynamic: 4 * SHADER_STAGE_COUNT,
-            max_descriptor_set_sampled_images: pc
-                .max_textures_per_stage
-                .min(pc.max_samplers_per_stage)
-                as usize
-                * SHADER_STAGE_COUNT,
-            max_descriptor_set_storage_images: pc.max_textures_per_stage as usize
-                * SHADER_STAGE_COUNT,
-            max_descriptor_set_input_attachments: pc.max_textures_per_stage as usize
-                * SHADER_STAGE_COUNT,
-            max_fragment_input_components: pc.max_fragment_input_components as usize,
-            max_framebuffer_layers: 2048, // TODO: Determine is this is the correct value
-            max_memory_allocation_count: 4096, // TODO: Determine is this is the correct value
-
-            max_per_stage_descriptor_samplers: pc.max_samplers_per_stage as usize,
-            max_per_stage_descriptor_uniform_buffers: pc.max_buffers_per_stage as usize,
-            max_per_stage_descriptor_storage_buffers: pc.max_buffers_per_stage as usize,
-            max_per_stage_descriptor_sampled_images: pc
-                .max_textures_per_stage
-                .min(pc.max_samplers_per_stage)
-                as usize,
-            max_per_stage_descriptor_storage_images: pc.max_textures_per_stage as usize,
-            max_per_stage_descriptor_input_attachments: pc.max_textures_per_stage as usize, //TODO
-            max_per_stage_resources: 0x100,                                                 //TODO
-
-            max_patch_size: 0, // No tessellation
-
-            // Note: The maximum number of supported viewports and scissor rectangles varies by device.
-            // TODO: read from Metal Feature Sets.
-            max_viewports: 1,
-            max_viewport_dimensions: [pc.max_texture_size as _; 2],
-            max_framebuffer_extent: hal::image::Extent {
-                //TODO
-                width: pc.max_texture_size as _,
-                height: pc.max_texture_size as _,
-                depth: pc.max_texture_layers as _,
-            },
-            min_memory_map_alignment: 4,
-
-            optimal_buffer_copy_offset_alignment: pc.buffer_alignment,
-            optimal_buffer_copy_pitch_alignment: 4,
-            min_texel_buffer_offset_alignment: pc.buffer_alignment,
-            min_uniform_buffer_offset_alignment: pc.buffer_alignment,
-            min_storage_buffer_offset_alignment: pc.buffer_alignment,
-
-            max_compute_work_group_count: [!0; 3], // really undefined
-            max_compute_work_group_size: {
-                let size = device.max_threads_per_threadgroup();
-                [size.width as u32, size.height as u32, size.depth as u32]
-            },
-            max_compute_shared_memory_size: pc.max_total_threadgroup_memory as usize,
-
-            max_vertex_input_attributes: 31,
-            max_vertex_input_bindings: 31,
-            max_vertex_input_attribute_offset: 255, // TODO
-            max_vertex_input_binding_stride: 256,   // TODO
-            max_vertex_output_components: pc.max_fragment_input_components as usize,
-
-            framebuffer_color_sample_counts: 0b101,   // TODO
-            framebuffer_depth_sample_counts: 0b101,   // TODO
-            framebuffer_stencil_sample_counts: 0b101, // TODO
-            max_color_attachments: pc.max_color_render_targets as usize,
-
-            buffer_image_granularity: 1,
-            // Note: we issue Metal buffer-to-buffer copies on memory flush/invalidate,
-            // and those need to operate on sizes being multiples of 4.
-            non_coherent_atom_size: 4,
-            max_sampler_anisotropy: 16.,
-            min_vertex_input_binding_stride_alignment: STRIDE_GRANULARITY as u64,
-
-            ..hal::Limits::default() // TODO!
+            ..hal::PhysicalDeviceProperties::default()
         }
     }
 }
@@ -568,37 +598,44 @@ impl Device {
         }
     }
 
+    #[cfg(feature = "cross")]
     fn compile_shader_library_cross(
         device: &Mutex<metal::Device>,
         raw_data: &[u32],
-        compiler_options: &msl::CompilerOptions,
+        compiler_options: &spirv_cross::msl::CompilerOptions,
         msl_version: MTLLanguageVersion,
         specialization: &pso::Specialization,
+        stage: naga::ShaderStage,
     ) -> Result<n::ModuleInfo, String> {
-        let module = spirv::Module::from_words(raw_data);
+        use spirv_cross::ErrorCode as Ec;
+
+        let module = spirv_cross::spirv::Module::from_words(raw_data);
 
         // now parse again using the new overrides
-        let mut ast = spirv::Ast::<msl::Target>::parse(&module).map_err(|err| match err {
-            SpirvErrorCode::CompilationError(msg) => msg,
-            SpirvErrorCode::Unhandled => "Unexpected parse error".into(),
-        })?;
+        let mut ast =
+            spirv_cross::spirv::Ast::<spirv_cross::msl::Target>::parse(&module).map_err(|err| {
+                match err {
+                    Ec::CompilationError(msg) => msg,
+                    Ec::Unhandled => "Unexpected parse error".into(),
+                }
+            })?;
 
-        spirv_cross_specialize_ast(&mut ast, specialization)?;
+        auxil::spirv_cross_specialize_ast(&mut ast, specialization)?;
 
         ast.set_compiler_options(compiler_options)
             .map_err(|err| match err {
-                SpirvErrorCode::CompilationError(msg) => msg,
-                SpirvErrorCode::Unhandled => "Unexpected error".into(),
+                Ec::CompilationError(msg) => msg,
+                Ec::Unhandled => "Unexpected error".into(),
             })?;
 
         let entry_points = ast.get_entry_points().map_err(|err| match err {
-            SpirvErrorCode::CompilationError(msg) => msg,
-            SpirvErrorCode::Unhandled => "Unexpected entry point error".into(),
+            Ec::CompilationError(msg) => msg,
+            Ec::Unhandled => "Unexpected entry point error".into(),
         })?;
 
         let shader_code = ast.compile().map_err(|err| match err {
-            SpirvErrorCode::CompilationError(msg) => msg,
-            SpirvErrorCode::Unhandled => "Unknown compile error".into(),
+            Ec::CompilationError(msg) => msg,
+            Ec::Unhandled => "Unknown compile error".into(),
         })?;
 
         let mut entry_point_map = n::EntryPointMap::default();
@@ -607,14 +644,18 @@ impl Device {
             let cleansed = ast
                 .get_cleansed_entry_point_name(&entry_point.name, entry_point.execution_model)
                 .map_err(|err| match err {
-                    SpirvErrorCode::CompilationError(msg) => msg,
-                    SpirvErrorCode::Unhandled => "Unknown compile error".into(),
+                    Ec::CompilationError(msg) => msg,
+                    Ec::Unhandled => "Unknown compile error".into(),
                 })?;
             entry_point_map.insert(
-                entry_point.name,
-                spirv::EntryPoint {
-                    name: cleansed,
-                    ..entry_point
+                (stage, entry_point.name),
+                n::EntryPoint {
+                    internal_name: cleansed,
+                    work_group_size: [
+                        entry_point.work_group_size.x,
+                        entry_point.work_group_size.y,
+                        entry_point.work_group_size.z,
+                    ],
                 },
             );
         }
@@ -625,7 +666,6 @@ impl Device {
 
         // done
         debug!("SPIRV-Cross generated shader:\n{}", shader_code);
-
         let options = metal::CompileOptions::new();
         options.set_language_version(msl_version);
 
@@ -641,31 +681,32 @@ impl Device {
         })
     }
 
-    #[cfg(feature = "naga")]
     fn compile_shader_library_naga(
         device: &Mutex<metal::Device>,
-        module: &naga::Module,
+        shader: &d::NagaShader,
         naga_options: &naga::back::msl::Options,
-    ) -> Result<n::ModuleInfo, d::ShaderError> {
-        let (source, info) = naga::back::msl::write_string(module, naga_options)
-            .map_err(|e| d::ShaderError::CompilationFailed(format!("{:?}", e)))?;
+    ) -> Result<n::ModuleInfo, String> {
+        let (source, info) =
+            match naga::back::msl::write_string(&shader.module, &shader.analysis, naga_options) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Naga: {:?}", e);
+                    return Err(format!("MSL: {:?}", e));
+                }
+            };
 
         let mut entry_point_map = n::EntryPointMap::default();
-        for ((pair, ep), name) in module.entry_points.iter().zip(info.entry_point_names) {
+        for (ep, name) in shader
+            .module
+            .entry_points
+            .iter()
+            .zip(info.entry_point_names)
+        {
             entry_point_map.insert(
-                pair.1.clone(),
-                spirv::EntryPoint {
-                    name,
-                    execution_model: match pair.0 {
-                        naga::ShaderStage::Vertex => spirv::ExecutionModel::Vertex,
-                        naga::ShaderStage::Fragment => spirv::ExecutionModel::Fragment,
-                        naga::ShaderStage::Compute => spirv::ExecutionModel::GlCompute,
-                    },
-                    work_group_size: spirv::WorkGroupSize {
-                        x: ep.workgroup_size[0],
-                        y: ep.workgroup_size[1],
-                        z: ep.workgroup_size[2],
-                    },
+                (ep.stage, ep.name.clone()),
+                n::EntryPoint {
+                    internal_name: name.map_err(|err| format!("{}", err))?,
+                    work_group_size: ep.workgroup_size,
                 },
             );
         }
@@ -680,6 +721,7 @@ impl Device {
             (2, 0) => MTLLanguageVersion::V2_0,
             (2, 1) => MTLLanguageVersion::V2_1,
             (2, 2) => MTLLanguageVersion::V2_2,
+            (2, 3) => MTLLanguageVersion::V2_3,
             other => panic!("Unexpected language version {:?}", other),
         };
         options.set_language_version(msl_version);
@@ -687,7 +729,7 @@ impl Device {
         let library = device
             .lock()
             .new_library_with_source(source.as_ref(), &options)
-            .map_err(|err| d::ShaderError::CompilationFailed(err.into()))?;
+            .map_err(|err| format!("{:?}", err))?;
 
         Ok(n::ModuleInfo {
             library,
@@ -702,64 +744,71 @@ impl Device {
         layout: &n::PipelineLayout,
         primitive_class: MTLPrimitiveTopologyClass,
         pipeline_cache: Option<&n::PipelineCache>,
-        stage: ShaderStage,
+        stage: naga::ShaderStage,
     ) -> Result<(metal::Library, metal::Function, metal::MTLSize, bool), pso::CreationError> {
         let device = &self.shared.device;
-        let msl_version = self.shared.private_caps.msl_version;
-        let module_map;
-        let (info_owned, info_guard);
+        #[cfg(feature = "cross")]
+        let (module_map, info_guard);
+        let info_owned;
 
-        let compiler_options = &mut match primitive_class {
-            MTLPrimitiveTopologyClass::Point => layout.shader_compiler_options_point.clone(),
-            _ => layout.shader_compiler_options.clone(),
-        };
-        compiler_options.entry_point = Some((
-            ep.entry.to_string(),
-            match stage {
-                ShaderStage::Vertex => spirv::ExecutionModel::Vertex,
-                ShaderStage::Fragment => spirv::ExecutionModel::Fragment,
-                ShaderStage::Compute => spirv::ExecutionModel::GlCompute,
-                _ => return Err(pso::CreationError::UnsupportedPipeline),
-            },
-        ));
+        #[cfg(feature = "cross")]
+        let mut compiler_options = layout.spirv_cross_options.clone();
+        #[cfg(feature = "cross")]
+        {
+            compiler_options.entry_point =
+                Some((ep.entry.to_string(), conv::map_naga_stage_to_cross(stage)));
+            compiler_options.enable_point_size_builtin =
+                primitive_class == MTLPrimitiveTopologyClass::Point;
+        }
+        let _ = primitive_class;
 
-        let data = &ep.module.spv;
         let info = match pipeline_cache {
+            #[cfg(feature = "cross")]
             Some(cache) => {
                 module_map = cache
                     .modules
-                    .get_or_create_with(compiler_options, FastStorageMap::default);
-                info_guard = module_map.get_or_create_with(data, || {
+                    .get_or_create_with(&compiler_options, FastStorageMap::default);
+                info_guard = module_map.get_or_create_with(&ep.module.spv, || {
                     Self::compile_shader_library_cross(
                         device,
-                        data,
-                        compiler_options,
-                        msl_version,
+                        &ep.module.spv,
+                        &compiler_options,
+                        self.shared.private_caps.msl_version,
                         &ep.specialization,
+                        stage,
                     )
                     .unwrap()
                 });
                 &*info_guard
             }
-            None => {
-                let mut result = Err(d::ShaderError::CompilationFailed(String::new()));
-                #[cfg(feature = "naga")]
-                if let Some(ref module) = ep.module.naga {
-                    result =
-                        Self::compile_shader_library_naga(device, module, &layout.naga_options);
-                    if let Err(d::ShaderError::CompilationFailed(ref msg)) = result {
-                        warn!("Naga: {:?}", msg);
+            _ => {
+                let mut result = Err(String::new());
+                if ep.module.prefer_naga {
+                    result = match ep.module.naga {
+                        Ok(ref shader) => {
+                            Self::compile_shader_library_naga(device, shader, &layout.naga_options)
+                        }
+                        Err(ref e) => Err(e.clone()),
                     }
                 }
+                #[cfg(feature = "cross")]
                 if result.is_err() {
                     result = Self::compile_shader_library_cross(
                         device,
-                        data,
-                        compiler_options,
-                        msl_version,
+                        &ep.module.spv,
+                        &compiler_options,
+                        self.shared.private_caps.msl_version,
                         &ep.specialization,
-                    )
-                    .map_err(d::ShaderError::CompilationFailed);
+                        stage,
+                    );
+                }
+                if result.is_err() && !ep.module.prefer_naga {
+                    result = match ep.module.naga {
+                        Ok(ref shader) => {
+                            Self::compile_shader_library_naga(device, shader, &layout.naga_options)
+                        }
+                        Err(ref e) => Err(e.clone()),
+                    }
                 }
                 info_owned = result.map_err(|e| {
                     error!("Error compiling the shader {:?}", e);
@@ -770,13 +819,15 @@ impl Device {
         };
 
         let lib = info.library.clone();
-        let (name, wg_size) = match info.entry_point_map.get(ep.entry) {
+        let entry_key = (stage, ep.entry.to_string());
+        //TODO: avoid heap-allocating the string?
+        let (name, wg_size) = match info.entry_point_map.get(&entry_key) {
             Some(p) => (
-                p.name.as_str(),
+                p.internal_name.as_str(),
                 metal::MTLSize {
-                    width: p.work_group_size.x as _,
-                    height: p.work_group_size.y as _,
-                    depth: p.work_group_size.z as _,
+                    width: p.work_group_size[0] as _,
+                    height: p.work_group_size[1] as _,
+                    depth: p.work_group_size[2] as _,
                 },
             ),
             // this can only happen if the shader came directly from the user
@@ -870,7 +921,9 @@ impl Device {
         Some(descriptor)
     }
 
-    fn make_sampler_data(info: &image::SamplerDesc) -> msl::SamplerData {
+    #[cfg(feature = "cross")]
+    fn make_sampler_data(info: &image::SamplerDesc) -> spirv_cross::msl::SamplerData {
+        use spirv_cross::msl;
         fn map_address(wrap: image::WrapMode) -> msl::SamplerAddress {
             match wrap {
                 image::WrapMode::Tile => msl::SamplerAddress::Repeat,
@@ -954,29 +1007,20 @@ impl hal::device::Device<Backend> for Device {
         pool.reset(false);
     }
 
-    unsafe fn create_render_pass<'a, IA, IS, ID>(
+    unsafe fn create_render_pass<'a, Ia, Is, Id>(
         &self,
-        attachments: IA,
-        subpasses: IS,
-        _dependencies: ID,
+        attachments: Ia,
+        subpasses: Is,
+        _dependencies: Id,
     ) -> Result<n::RenderPass, d::OutOfMemory>
     where
-        IA: IntoIterator,
-        IA::Item: Borrow<pass::Attachment>,
-        IS: IntoIterator,
-        IS::Item: Borrow<pass::SubpassDesc<'a>>,
-        ID: IntoIterator,
-        ID::Item: Borrow<pass::SubpassDependency>,
+        Ia: Iterator<Item = pass::Attachment>,
+        Is: Iterator<Item = pass::SubpassDesc<'a>>,
     {
-        let attachments: Vec<pass::Attachment> = attachments
-            .into_iter()
-            .map(|at| at.borrow().clone())
-            .collect();
+        let attachments: Vec<pass::Attachment> = attachments.collect();
 
         let mut subpasses: Vec<n::Subpass> = subpasses
-            .into_iter()
-            .map(|sp| {
-                let sub = sp.borrow();
+            .map(|sub| {
                 let mut colors: ArrayVec<[_; MAX_COLOR_ATTACHMENTS]> = sub
                     .colors
                     .iter()
@@ -1015,12 +1059,20 @@ impl hal::device::Device<Backend> for Device {
                     }
                 });
 
+                let samples = colors
+                    .iter()
+                    .chain(depth_stencil.as_ref())
+                    .map(|at_info| attachments[at_info.id].samples)
+                    .max()
+                    .unwrap_or(1);
+
                 n::Subpass {
                     attachments: n::SubpassData {
                         colors,
                         depth_stencil,
                     },
                     inputs: sub.inputs.iter().map(|&(id, _)| id).collect(),
+                    samples,
                 }
             })
             .collect();
@@ -1066,45 +1118,48 @@ impl hal::device::Device<Backend> for Device {
         })
     }
 
-    unsafe fn create_pipeline_layout<IS, IR>(
+    unsafe fn create_pipeline_layout<'a, Is, Ic>(
         &self,
-        set_layouts: IS,
-        push_constant_ranges: IR,
+        set_layouts: Is,
+        push_constant_ranges: Ic,
     ) -> Result<n::PipelineLayout, d::OutOfMemory>
     where
-        IS: IntoIterator,
-        IS::Item: Borrow<n::DescriptorSetLayout>,
-        IR: IntoIterator,
-        IR::Item: Borrow<(pso::ShaderStageFlags, Range<u32>)>,
+        Is: Iterator<Item = &'a n::DescriptorSetLayout>,
+        Ic: Iterator<Item = (pso::ShaderStageFlags, Range<u32>)>,
     {
+        struct StageInfo {
+            stage: naga::ShaderStage,
+            counters: n::ResourceData<ResourceIndex>,
+            push_constant_buffer: Option<ResourceIndex>,
+        }
         let mut stage_infos = [
-            (
-                pso::ShaderStageFlags::VERTEX,
-                spirv::ExecutionModel::Vertex,
-                n::ResourceData::<ResourceIndex>::new(),
-            ),
-            (
-                pso::ShaderStageFlags::FRAGMENT,
-                spirv::ExecutionModel::Fragment,
-                n::ResourceData::<ResourceIndex>::new(),
-            ),
-            (
-                pso::ShaderStageFlags::COMPUTE,
-                spirv::ExecutionModel::GlCompute,
-                n::ResourceData::<ResourceIndex>::new(),
-            ),
+            StageInfo {
+                stage: naga::ShaderStage::Vertex,
+                counters: n::ResourceData::new(),
+                push_constant_buffer: None,
+            },
+            StageInfo {
+                stage: naga::ShaderStage::Fragment,
+                counters: n::ResourceData::new(),
+                push_constant_buffer: None,
+            },
+            StageInfo {
+                stage: naga::ShaderStage::Compute,
+                counters: n::ResourceData::new(),
+                push_constant_buffer: None,
+            },
         ];
-        let mut res_overrides = BTreeMap::new();
+        let mut binding_map = FastHashMap::default();
+        let mut argument_buffer_bindings = FastHashMap::default();
+        #[cfg(feature = "cross")]
         let mut const_samplers = BTreeMap::new();
         let mut infos = Vec::new();
 
         // First, place the push constants
-        let mut pc_buffers = [None; 3];
         let mut pc_limits = [0u32; 3];
-        for pcr in push_constant_ranges {
-            let (flags, range) = pcr.borrow();
-            for (limit, &(stage_bit, _, _)) in pc_limits.iter_mut().zip(&stage_infos) {
-                if flags.contains(stage_bit) {
+        for (flags, range) in push_constant_ranges {
+            for (limit, info) in pc_limits.iter_mut().zip(&stage_infos) {
+                if flags.contains(info.stage.into()) {
                     debug_assert_eq!(range.end % 4, 0);
                     *limit = (range.end / 4).max(*limit);
                 }
@@ -1121,55 +1176,39 @@ impl hal::device::Device<Backend> for Device {
             }
         }
 
-        for ((limit, ref mut buffer_index), &mut (_, stage, ref mut counters)) in pc_limits
-            .iter()
-            .zip(pc_buffers.iter_mut())
-            .zip(stage_infos.iter_mut())
-        {
+        for (limit, info) in pc_limits.iter().zip(stage_infos.iter_mut()) {
             // handle the push constant buffer assignment and shader overrides
             if *limit != 0 {
-                let index = counters.buffers;
-                **buffer_index = Some(index);
-                counters.buffers += 1;
-
-                res_overrides.insert(
-                    msl::ResourceBindingLocation {
-                        stage,
-                        desc_set: PUSH_CONSTANTS_DESC_SET,
-                        binding: PUSH_CONSTANTS_DESC_BINDING,
-                    },
-                    msl::ResourceBinding {
-                        buffer_id: index as _,
-                        texture_id: !0,
-                        sampler_id: !0,
-                    },
-                );
+                info.push_constant_buffer = Some(info.counters.buffers);
+                info.counters.buffers += 1;
             }
         }
 
         // Second, place the descripted resources
-        for (set_index, set_layout) in set_layouts.into_iter().enumerate() {
+        for (set_index, set_layout) in set_layouts.enumerate() {
             // remember where the resources for this set start at each shader stage
             let mut dynamic_buffers = Vec::new();
             let offsets = n::MultiStageResourceCounters {
-                vs: stage_infos[0].2.clone(),
-                ps: stage_infos[1].2.clone(),
-                cs: stage_infos[2].2.clone(),
+                vs: stage_infos[0].counters.clone(),
+                ps: stage_infos[1].counters.clone(),
+                cs: stage_infos[2].counters.clone(),
             };
-            match *set_layout.borrow() {
+            match *set_layout {
                 n::DescriptorSetLayout::Emulated {
                     layouts: ref desc_layouts,
+                    #[cfg(feature = "cross")]
                     ref immutable_samplers,
-                    total: _,
+                    ..
                 } => {
-                    for (&binding, data) in immutable_samplers.iter() {
+                    #[cfg(feature = "cross")]
+                    for (&binding, immutable_sampler) in immutable_samplers.iter() {
                         //TODO: array support?
                         const_samplers.insert(
-                            msl::SamplerLocation {
+                            spirv_cross::msl::SamplerLocation {
                                 desc_set: set_index as u32,
                                 binding,
                             },
-                            data.clone(),
+                            immutable_sampler.cross_data.clone(),
                         );
                     }
                     for layout in desc_layouts.iter() {
@@ -1179,92 +1218,69 @@ impl hal::device::Device<Backend> for Device {
                         {
                             dynamic_buffers.alloc().init(n::MultiStageData {
                                 vs: if layout.stages.contains(pso::ShaderStageFlags::VERTEX) {
-                                    stage_infos[0].2.buffers
+                                    stage_infos[0].counters.buffers
                                 } else {
                                     !0
                                 },
                                 ps: if layout.stages.contains(pso::ShaderStageFlags::FRAGMENT) {
-                                    stage_infos[1].2.buffers
+                                    stage_infos[1].counters.buffers
                                 } else {
                                     !0
                                 },
                                 cs: if layout.stages.contains(pso::ShaderStageFlags::COMPUTE) {
-                                    stage_infos[2].2.buffers
+                                    stage_infos[2].counters.buffers
                                 } else {
                                     !0
                                 },
                             });
                         }
-                        for &mut (stage_bit, stage, ref mut counters) in stage_infos.iter_mut() {
-                            if !layout.stages.contains(stage_bit) {
+                        for info in stage_infos.iter_mut() {
+                            if !layout.stages.contains(info.stage.into()) {
                                 continue;
                             }
-                            let res = msl::ResourceBinding {
-                                buffer_id: if layout.content.contains(n::DescriptorContent::BUFFER)
-                                {
-                                    counters.buffers as _
+                            let target = naga::back::msl::BindTarget {
+                                buffer: if layout.content.contains(n::DescriptorContent::BUFFER) {
+                                    Some(info.counters.buffers as _)
                                 } else {
-                                    !0
+                                    None
                                 },
-                                texture_id: if layout
-                                    .content
-                                    .contains(n::DescriptorContent::TEXTURE)
-                                {
-                                    counters.textures as _
+                                texture: if layout.content.contains(n::DescriptorContent::TEXTURE) {
+                                    Some(info.counters.textures as _)
                                 } else {
-                                    !0
+                                    None
                                 },
-                                sampler_id: if layout
-                                    .content
-                                    .contains(n::DescriptorContent::SAMPLER)
-                                {
-                                    counters.samplers as _
+                                sampler: if layout.content.contains(n::DescriptorContent::SAMPLER) {
+                                    Some(info.counters.samplers as _)
                                 } else {
-                                    !0
+                                    None
                                 },
+                                mutable: layout.content.contains(n::DescriptorContent::WRITABLE),
                             };
-                            counters.add(layout.content);
+                            info.counters.add(layout.content);
                             if layout.array_index == 0 {
-                                let location = msl::ResourceBindingLocation {
-                                    stage,
-                                    desc_set: set_index as _,
+                                let source = naga::back::msl::BindSource {
+                                    stage: info.stage,
+                                    group: set_index as _,
                                     binding: layout.binding,
                                 };
-                                res_overrides.insert(location, res);
+                                binding_map.insert(source, target);
                             }
                         }
                     }
                 }
                 n::DescriptorSetLayout::ArgumentBuffer {
-                    ref bindings,
+                    bindings: _,
                     stage_flags,
                     ..
                 } => {
-                    for &mut (stage_bit, stage, ref mut counters) in stage_infos.iter_mut() {
-                        let has_stage = stage_flags.contains(stage_bit);
-                        res_overrides.insert(
-                            msl::ResourceBindingLocation {
-                                stage,
-                                desc_set: set_index as _,
-                                binding: msl::ARGUMENT_BUFFER_BINDING,
-                            },
-                            msl::ResourceBinding {
-                                buffer_id: if has_stage { counters.buffers } else { !0 },
-                                texture_id: !0,
-                                sampler_id: !0,
-                            },
-                        );
-                        if has_stage {
-                            res_overrides.extend(bindings.iter().map(|(&binding, arg)| {
-                                let key = msl::ResourceBindingLocation {
-                                    stage,
-                                    desc_set: set_index as _,
-                                    binding,
-                                };
-                                (key, arg.res.clone())
-                            }));
-                            counters.buffers += 1;
+                    for info in stage_infos.iter_mut() {
+                        if !stage_flags.contains(info.stage.into()) {
+                            continue;
                         }
+                        //TODO: mark `bindings` as belonging to the argument buffer
+                        argument_buffer_bindings
+                            .insert((info.stage, set_index as u32), info.counters.buffers);
+                        info.counters.buffers += 1;
                     }
                 }
             }
@@ -1276,102 +1292,138 @@ impl hal::device::Device<Backend> for Device {
         }
 
         // Finally, make sure we fit the limits
-        for &(_, _, ref counters) in stage_infos.iter() {
-            assert!(counters.buffers <= self.shared.private_caps.max_buffers_per_stage);
-            assert!(counters.textures <= self.shared.private_caps.max_textures_per_stage);
-            assert!(counters.samplers <= self.shared.private_caps.max_samplers_per_stage);
+        for info in stage_infos.iter() {
+            assert!(info.counters.buffers <= self.shared.private_caps.max_buffers_per_stage);
+            assert!(info.counters.textures <= self.shared.private_caps.max_textures_per_stage);
+            assert!(info.counters.samplers <= self.shared.private_caps.max_samplers_per_stage);
         }
 
-        #[cfg(feature = "naga")]
-        let naga_options = {
-            use naga::back::msl;
-            fn res_index(id: u32) -> Option<u8> {
-                if id == !0 {
-                    None
-                } else {
-                    Some(id as _)
-                }
+        #[cfg(feature = "cross")]
+        let spirv_cross_options = {
+            use spirv_cross::msl;
+            const PUSH_CONSTANTS_DESC_SET: u32 = !0;
+            const PUSH_CONSTANTS_DESC_BINDING: u32 = 0;
+
+            let mut compiler_options = msl::CompilerOptions::default();
+            compiler_options.version = match self.shared.private_caps.msl_version {
+                MTLLanguageVersion::V1_0 => msl::Version::V1_0,
+                MTLLanguageVersion::V1_1 => msl::Version::V1_1,
+                MTLLanguageVersion::V1_2 => msl::Version::V1_2,
+                MTLLanguageVersion::V2_0 => msl::Version::V2_0,
+                MTLLanguageVersion::V2_1 => msl::Version::V2_1,
+                MTLLanguageVersion::V2_2 => msl::Version::V2_2,
+                MTLLanguageVersion::V2_3 => msl::Version::V2_3,
+            };
+            compiler_options.enable_point_size_builtin = false;
+            compiler_options.vertex.invert_y = !self.features.contains(hal::Features::NDC_Y_UP);
+            // populate resource overrides
+            for (source, target) in binding_map.iter() {
+                compiler_options.resource_binding_overrides.insert(
+                    msl::ResourceBindingLocation {
+                        stage: conv::map_naga_stage_to_cross(source.stage),
+                        desc_set: source.group,
+                        binding: source.binding,
+                    },
+                    msl::ResourceBinding {
+                        buffer_id: target.buffer.map_or(!0, |id| id as u32),
+                        texture_id: target.texture.map_or(!0, |id| id as u32),
+                        sampler_id: target.sampler.map_or(!0, |id| id as u32),
+                        count: 0,
+                    },
+                );
             }
-            msl::Options {
-                lang_version: match self.shared.private_caps.msl_version {
-                    MTLLanguageVersion::V1_0 => (1, 0),
-                    MTLLanguageVersion::V1_1 => (1, 1),
-                    MTLLanguageVersion::V1_2 => (1, 2),
-                    MTLLanguageVersion::V2_0 => (2, 0),
-                    MTLLanguageVersion::V2_1 => (2, 1),
-                    MTLLanguageVersion::V2_2 => (2, 2),
-                    MTLLanguageVersion::V2_3 => (2, 3),
-                },
-                spirv_cross_compatibility: true,
-                binding_map: res_overrides
-                    .iter()
-                    .map(|(loc, binding)| {
-                        let source = msl::BindSource {
-                            stage: match loc.stage {
-                                spirv::ExecutionModel::Vertex => naga::ShaderStage::Vertex,
-                                spirv::ExecutionModel::Fragment => naga::ShaderStage::Fragment,
-                                spirv::ExecutionModel::GlCompute => naga::ShaderStage::Compute,
-                                other => panic!("Unexpected stage: {:?}", other),
-                            },
-                            group: loc.desc_set,
-                            binding: loc.binding,
-                        };
-                        let target = msl::BindTarget {
-                            buffer: res_index(binding.buffer_id),
-                            texture: res_index(binding.texture_id),
-                            sampler: res_index(binding.sampler_id),
-                            mutable: false, //TODO
-                        };
-                        (source, target)
-                    })
-                    .collect(),
+            // argument buffers
+            for ((stage, desc_set), buffer_id) in argument_buffer_bindings {
+                compiler_options.resource_binding_overrides.insert(
+                    msl::ResourceBindingLocation {
+                        stage: conv::map_naga_stage_to_cross(stage),
+                        desc_set,
+                        binding: msl::ARGUMENT_BUFFER_BINDING,
+                    },
+                    msl::ResourceBinding {
+                        buffer_id,
+                        texture_id: !0,
+                        sampler_id: !0,
+                        count: 0,
+                    },
+                );
+                //TODO: assign argument buffer locations
             }
+            // push constants
+            for info in stage_infos.iter() {
+                let buffer_id = match info.push_constant_buffer {
+                    Some(id) => id,
+                    None => continue,
+                };
+                compiler_options.resource_binding_overrides.insert(
+                    msl::ResourceBindingLocation {
+                        stage: conv::map_naga_stage_to_cross(info.stage),
+                        desc_set: PUSH_CONSTANTS_DESC_SET,
+                        binding: PUSH_CONSTANTS_DESC_BINDING,
+                    },
+                    msl::ResourceBinding {
+                        buffer_id,
+                        texture_id: !0,
+                        sampler_id: !0,
+                        count: 0,
+                    },
+                );
+            }
+            // other properties
+            compiler_options.const_samplers = const_samplers;
+            compiler_options.enable_argument_buffers = self.shared.private_caps.argument_buffers;
+            compiler_options.force_zero_initialized_variables = true;
+            compiler_options.force_native_arrays = true;
+
+            let mut compiler_options_point = compiler_options.clone();
+            compiler_options_point.enable_point_size_builtin = true;
+            compiler_options
         };
 
-        let mut shader_compiler_options = msl::CompilerOptions::default();
-        shader_compiler_options.version = match self.shared.private_caps.msl_version {
-            MTLLanguageVersion::V1_0 => msl::Version::V1_0,
-            MTLLanguageVersion::V1_1 => msl::Version::V1_1,
-            MTLLanguageVersion::V1_2 => msl::Version::V1_2,
-            MTLLanguageVersion::V2_0 => msl::Version::V2_0,
-            MTLLanguageVersion::V2_1 => msl::Version::V2_1,
-            MTLLanguageVersion::V2_2 => msl::Version::V2_2,
-            MTLLanguageVersion::V2_3 => msl::Version::V2_2, //TODO: update this!
+        let naga_options = naga::back::msl::Options {
+            lang_version: match self.shared.private_caps.msl_version {
+                MTLLanguageVersion::V1_0 => (1, 0),
+                MTLLanguageVersion::V1_1 => (1, 1),
+                MTLLanguageVersion::V1_2 => (1, 2),
+                MTLLanguageVersion::V2_0 => (2, 0),
+                MTLLanguageVersion::V2_1 => (2, 1),
+                MTLLanguageVersion::V2_2 => (2, 2),
+                MTLLanguageVersion::V2_3 => (2, 3),
+            },
+            binding_map,
+            spirv_cross_compatibility: cfg!(feature = "cross"),
+            fake_missing_bindings: false,
         };
-        shader_compiler_options.enable_point_size_builtin = false;
-        shader_compiler_options.vertex.invert_y = !self.features.contains(hal::Features::NDC_Y_UP);
-        shader_compiler_options.resource_binding_overrides = res_overrides;
-        shader_compiler_options.const_samplers = const_samplers;
-        shader_compiler_options.enable_argument_buffers = self.shared.private_caps.argument_buffers;
-        shader_compiler_options.force_zero_initialized_variables = true;
-        shader_compiler_options.force_native_arrays = true;
-        let mut shader_compiler_options_point = shader_compiler_options.clone();
-        shader_compiler_options_point.enable_point_size_builtin = true;
 
         Ok(n::PipelineLayout {
-            shader_compiler_options,
-            shader_compiler_options_point,
-            #[cfg(feature = "naga")]
+            #[cfg(feature = "cross")]
+            spirv_cross_options,
             naga_options,
             infos,
             total: n::MultiStageResourceCounters {
-                vs: stage_infos[0].2.clone(),
-                ps: stage_infos[1].2.clone(),
-                cs: stage_infos[2].2.clone(),
+                vs: stage_infos[0].counters.clone(),
+                ps: stage_infos[1].counters.clone(),
+                cs: stage_infos[2].counters.clone(),
             },
             push_constants: n::MultiStageData {
-                vs: pc_buffers[0].map(|buffer_index| n::PushConstantInfo {
-                    count: pc_limits[0],
-                    buffer_index,
-                }),
-                ps: pc_buffers[1].map(|buffer_index| n::PushConstantInfo {
-                    count: pc_limits[1],
-                    buffer_index,
-                }),
-                cs: pc_buffers[2].map(|buffer_index| n::PushConstantInfo {
-                    count: pc_limits[2],
-                    buffer_index,
-                }),
+                vs: stage_infos[0]
+                    .push_constant_buffer
+                    .map(|buffer_index| n::PushConstantInfo {
+                        count: pc_limits[0],
+                        buffer_index,
+                    }),
+                ps: stage_infos[1]
+                    .push_constant_buffer
+                    .map(|buffer_index| n::PushConstantInfo {
+                        count: pc_limits[1],
+                        buffer_index,
+                    }),
+                cs: stage_infos[2]
+                    .push_constant_buffer
+                    .map(|buffer_index| n::PushConstantInfo {
+                        count: pc_limits[2],
+                        buffer_index,
+                    }),
             },
             total_push_constants: pc_limits[0].max(pc_limits[1]).max(pc_limits[2]),
         })
@@ -1382,6 +1434,7 @@ impl hal::device::Device<Backend> for Device {
         _data: Option<&[u8]>,
     ) -> Result<n::PipelineCache, d::OutOfMemory> {
         Ok(n::PipelineCache {
+            #[cfg(feature = "cross")]
             modules: FastStorageMap::default(),
         })
     }
@@ -1398,38 +1451,42 @@ impl hal::device::Device<Backend> for Device {
         //drop
     }
 
-    unsafe fn merge_pipeline_caches<I>(
+    #[cfg_attr(not(feature = "cross"), allow(unused_variables))]
+    unsafe fn merge_pipeline_caches<'a, I>(
         &self,
-        target: &n::PipelineCache,
+        target: &mut n::PipelineCache,
         sources: I,
     ) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<n::PipelineCache>,
+        I: Iterator<Item = &'a n::PipelineCache>,
     {
-        let mut dst = target.modules.whole_write();
-        for source in sources {
-            let src = source.borrow().modules.whole_write();
-            for (key, value) in src.iter() {
-                let storage = dst
-                    .entry(key.clone())
-                    .or_insert_with(FastStorageMap::default);
-                let mut dst_module = storage.whole_write();
-                let src_module = value.whole_write();
-                for (key_module, value_module) in src_module.iter() {
-                    match dst_module.entry(key_module.clone()) {
-                        Entry::Vacant(em) => {
-                            em.insert(value_module.clone());
-                        }
-                        Entry::Occupied(em) => {
-                            if em.get().library.as_ptr() != value_module.library.as_ptr()
-                                || em.get().entry_point_map != value_module.entry_point_map
-                            {
-                                warn!(
-                                    "Merged module don't match, target: {:?}, source: {:?}",
-                                    em.get(),
-                                    value_module
-                                );
+        #[cfg(feature = "cross")]
+        {
+            //TODO: reduce the locking here
+            let mut dst = target.modules.whole_write();
+            for source in sources {
+                let src = source.modules.whole_write();
+                for (key, value) in src.iter() {
+                    let storage = dst
+                        .entry(key.clone())
+                        .or_insert_with(FastStorageMap::default);
+                    let mut dst_module = storage.whole_write();
+                    let src_module = value.whole_write();
+                    for (key_module, value_module) in src_module.iter() {
+                        match dst_module.entry(key_module.clone()) {
+                            Entry::Vacant(em) => {
+                                em.insert(value_module.clone());
+                            }
+                            Entry::Occupied(em) => {
+                                if em.get().library.as_ptr() != value_module.library.as_ptr()
+                                    || em.get().entry_point_map != value_module.entry_point_map
+                                {
+                                    warn!(
+                                        "Merged module don't match, target: {:?}, source: {:?}",
+                                        em.get(),
+                                        value_module
+                                    );
+                                }
                             }
                         }
                     }
@@ -1513,7 +1570,7 @@ impl hal::device::Device<Backend> for Device {
             pipeline_layout,
             primitive_class,
             cache,
-            ShaderStage::Vertex,
+            naga::ShaderStage::Vertex,
         )?;
         pipeline.set_vertex_function(Some(&vs_function));
 
@@ -1526,7 +1583,7 @@ impl hal::device::Device<Backend> for Device {
                     pipeline_layout,
                     primitive_class,
                     cache,
-                    ShaderStage::Fragment,
+                    naga::ShaderStage::Fragment,
                 )?;
                 fs_function = fun;
                 pipeline.set_fragment_function(Some(&fs_function));
@@ -1773,7 +1830,7 @@ impl hal::device::Device<Backend> for Device {
             &pipeline_desc.layout,
             MTLPrimitiveTopologyClass::Unspecified,
             cache,
-            ShaderStage::Compute,
+            naga::ShaderStage::Compute,
         )?;
         pipeline.set_compute_function(Some(&cs_function));
         if let Some(name) = pipeline_desc.label {
@@ -1809,62 +1866,46 @@ impl hal::device::Device<Backend> for Device {
         &self,
         raw_data: &[u32],
     ) -> Result<n::ShaderModule, d::ShaderError> {
-        //TODO: we can probably at least parse here and save the `Ast`
         Ok(n::ShaderModule {
+            prefer_naga: self.always_prefer_naga,
+            #[cfg(feature = "cross")]
             spv: raw_data.to_vec(),
-            #[cfg(all(feature = "naga", not(feature = "naga-in")))]
-            naga: None,
-            #[cfg(feature = "naga-in")]
             naga: {
                 let parser =
                     naga::front::spv::Parser::new(raw_data.iter().cloned(), &Default::default());
                 match parser.parse() {
-                    Ok(module) => match naga::proc::Validator::new().validate(&module) {
-                        Ok(()) => Some(module),
-                        Err(e) => {
-                            warn!("Naga validation failed: {:?}", e);
-                            None
+                    Ok(module) => {
+                        debug!("Naga module {:#?}", module);
+                        match naga::proc::Validator::new().validate(&module) {
+                            Ok(analysis) => Ok(d::NagaShader { module, analysis }),
+                            Err(e) => Err(format!("Naga validation: {:?}", e)),
                         }
-                    },
-                    Err(e) => {
-                        warn!("Naga parsing failed: {:?}", e);
-                        None
                     }
+                    Err(e) => Err(format!("Naga parsing: {:?}", e)),
                 }
             },
         })
     }
 
-    #[cfg(feature = "naga")]
     unsafe fn create_shader_module_from_naga(
         &self,
-        module: naga::Module,
-    ) -> Result<n::ShaderModule, (d::ShaderError, naga::Module)> {
-        use naga::back::spv;
-
-        let mut flags = spv::WriterFlags::empty();
-        if cfg!(debug_assertions) {
-            flags |= spv::WriterFlags::DEBUG;
-        }
-        let caps = [
-            spv::Capability::Shader,
-            spv::Capability::Matrix,
-            spv::Capability::Sampled1D,
-            spv::Capability::Image1D,
-            spv::Capability::DerivativeControl,
-            //TODO: fill out the rest
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        match spv::write_vec(&module, flags, caps) {
-            Ok(spv) => Ok(n::ShaderModule {
-                spv,
-                naga: Some(module),
-            }),
-            Err(e) => Err((d::ShaderError::CompilationFailed(format!("{}", e)), module)),
-        }
+        shader: d::NagaShader,
+    ) -> Result<n::ShaderModule, (d::ShaderError, d::NagaShader)> {
+        Ok(n::ShaderModule {
+            prefer_naga: true,
+            #[cfg(feature = "cross")]
+            spv: match naga::back::spv::write_vec(
+                &shader.module,
+                &shader.analysis,
+                &self.spv_options,
+            ) {
+                Ok(spv) => spv,
+                Err(e) => {
+                    return Err((d::ShaderError::CompilationFailed(format!("{}", e)), shader))
+                }
+            },
+            naga: Ok(shader),
+        })
     }
 
     unsafe fn create_sampler(
@@ -1876,6 +1917,7 @@ impl hal::device::Device<Backend> for Device {
                 Some(ref descriptor) => Some(self.shared.device.lock().new_sampler(descriptor)),
                 None => None,
             },
+            #[cfg(feature = "cross")]
             data: Self::make_sampler_data(&info),
         })
     }
@@ -1903,12 +1945,10 @@ impl hal::device::Device<Backend> for Device {
 
     unsafe fn flush_mapped_memory_ranges<'a, I>(&self, iter: I) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a n::Memory, memory::Segment)>,
+        I: Iterator<Item = (&'a n::Memory, memory::Segment)>,
     {
         debug!("flush_mapped_memory_ranges");
-        for item in iter {
-            let (memory, ref segment) = *item.borrow();
+        for (memory, ref segment) in iter {
             let range = memory.resolve(segment);
             debug!("\trange {:?}", range);
 
@@ -1932,8 +1972,7 @@ impl hal::device::Device<Backend> for Device {
 
     unsafe fn invalidate_mapped_memory_ranges<'a, I>(&self, iter: I) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a n::Memory, memory::Segment)>,
+        I: Iterator<Item = (&'a n::Memory, memory::Segment)>,
     {
         let mut num_syncs = 0;
         debug!("invalidate_mapped_memory_ranges");
@@ -1945,8 +1984,7 @@ impl hal::device::Device<Backend> for Device {
         autoreleasepool(|| {
             let encoder = cmd_buffer.new_blit_command_encoder();
 
-            for item in iter {
-                let (memory, ref segment) = *item.borrow();
+            for (memory, ref segment) in iter {
                 let range = memory.resolve(segment);
                 debug!("\trange {:?}", range);
 
@@ -1994,13 +2032,11 @@ impl hal::device::Device<Backend> for Device {
         _flags: pso::DescriptorPoolCreateFlags,
     ) -> Result<n::DescriptorPool, d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorRangeDesc>,
+        I: Iterator<Item = pso::DescriptorRangeDesc>,
     {
         if self.shared.private_caps.argument_buffers {
             let mut arguments = n::ArgumentArray::default();
-            for desc_range in descriptor_ranges {
-                let dr = desc_range.borrow();
+            for dr in descriptor_ranges {
                 let content = n::DescriptorContent::from(dr.ty);
                 let usage = n::ArgumentArray::describe_usage(dr.ty);
                 if content.contains(n::DescriptorContent::BUFFER) {
@@ -2030,8 +2066,7 @@ impl hal::device::Device<Backend> for Device {
             ))
         } else {
             let mut counters = n::ResourceData::<n::PoolResourceIndex>::new();
-            for desc_range in descriptor_ranges {
-                let dr = desc_range.borrow();
+            for dr in descriptor_ranges {
                 counters.add_many(
                     n::DescriptorContent::from(dr.ty),
                     dr.count as pso::DescriptorBinding,
@@ -2041,23 +2076,20 @@ impl hal::device::Device<Backend> for Device {
         }
     }
 
-    unsafe fn create_descriptor_set_layout<I, J>(
+    unsafe fn create_descriptor_set_layout<'a, I, J>(
         &self,
         binding_iter: I,
         immutable_samplers: J,
     ) -> Result<n::DescriptorSetLayout, d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
-        J: IntoIterator,
-        J::Item: Borrow<n::Sampler>,
+        I: Iterator<Item = pso::DescriptorSetLayoutBinding>,
+        J: Iterator<Item = &'a n::Sampler>,
     {
         if self.shared.private_caps.argument_buffers {
             let mut stage_flags = pso::ShaderStageFlags::empty();
             let mut arguments = n::ArgumentArray::default();
             let mut bindings = FastHashMap::default();
             for desc in binding_iter {
-                let desc = desc.borrow();
                 //TODO: have the API providing the dimensions and MSAA flag
                 // for textures in an argument buffer
                 match desc.ty {
@@ -2087,28 +2119,33 @@ impl hal::device::Device<Backend> for Device {
                 stage_flags |= desc.stage_flags;
                 let content = n::DescriptorContent::from(desc.ty);
                 let usage = n::ArgumentArray::describe_usage(desc.ty);
-                let res = msl::ResourceBinding {
-                    buffer_id: if content.contains(n::DescriptorContent::BUFFER) {
-                        arguments.push(metal::MTLDataType::Pointer, desc.count, usage) as u32
+                let bind_target = naga::back::msl::BindTarget {
+                    buffer: if content.contains(n::DescriptorContent::BUFFER) {
+                        Some(arguments.push(metal::MTLDataType::Pointer, desc.count, usage) as u8)
                     } else {
-                        !0
+                        None
                     },
-                    texture_id: if content.contains(n::DescriptorContent::TEXTURE) {
-                        arguments.push(metal::MTLDataType::Texture, desc.count, usage) as u32
+                    texture: if content.contains(n::DescriptorContent::TEXTURE) {
+                        Some(arguments.push(metal::MTLDataType::Texture, desc.count, usage) as u8)
                     } else {
-                        !0
+                        None
                     },
-                    sampler_id: if content.contains(n::DescriptorContent::SAMPLER) {
-                        arguments.push(metal::MTLDataType::Sampler, desc.count, usage) as u32
+                    sampler: if content.contains(n::DescriptorContent::SAMPLER) {
+                        Some(arguments.push(metal::MTLDataType::Sampler, desc.count, usage) as u8)
                     } else {
-                        !0
+                        None
                     },
+                    mutable: content.contains(n::DescriptorContent::WRITABLE),
                 };
-                let res_offset = res.buffer_id.min(res.texture_id).min(res.sampler_id);
+                let res_offset = bind_target
+                    .buffer
+                    .or(bind_target.texture)
+                    .or(bind_target.sampler)
+                    .unwrap() as u32;
                 bindings.insert(
                     desc.binding,
                     n::ArgumentLayout {
-                        res,
+                        bind_target,
                         res_offset,
                         count: desc.count,
                         usage,
@@ -2128,20 +2165,20 @@ impl hal::device::Device<Backend> for Device {
             })
         } else {
             struct TempSampler {
-                data: msl::SamplerData,
+                data: n::ImmutableSampler,
                 binding: pso::DescriptorBinding,
                 array_index: pso::DescriptorArrayIndex,
             }
-            let mut immutable_sampler_iter = immutable_samplers.into_iter();
+            let mut immutable_sampler_iter = immutable_samplers;
             let mut tmp_samplers = Vec::new();
             let mut desc_layouts = Vec::new();
             let mut total = n::ResourceData::new();
 
-            for set_layout_binding in binding_iter {
-                let slb = set_layout_binding.borrow();
+            for slb in binding_iter {
                 let mut content = n::DescriptorContent::from(slb.ty);
                 total.add_many(content, slb.count as _);
 
+                #[cfg_attr(not(feature = "cross"), allow(unused_variables))]
                 if slb.immutable_samplers {
                     tmp_samplers.extend(
                         immutable_sampler_iter
@@ -2149,7 +2186,10 @@ impl hal::device::Device<Backend> for Device {
                             .take(slb.count)
                             .enumerate()
                             .map(|(array_index, sm)| TempSampler {
-                                data: sm.borrow().data.clone(),
+                                data: n::ImmutableSampler {
+                                    #[cfg(feature = "cross")]
+                                    cross_data: sm.data.clone(),
+                                },
                                 binding: slb.binding,
                                 array_index,
                             }),
@@ -2193,8 +2233,7 @@ impl hal::device::Device<Backend> for Device {
 
     unsafe fn write_descriptor_set<'a, I>(&self, op: pso::DescriptorSetWrite<'a, Backend, I>)
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::Descriptor<'a, Backend>>,
+        I: Iterator<Item = pso::Descriptor<'a, Backend>>,
     {
         debug!("write_descriptor_set");
         match *op.set {
@@ -2216,7 +2255,7 @@ impl hal::device::Device<Backend> for Device {
 
                 for (layout, descriptor) in layouts[start.unwrap()..].iter().zip(op.descriptors) {
                     trace!("\t{:?}", layout);
-                    match *descriptor.borrow() {
+                    match descriptor {
                         pso::Descriptor::Sampler(sam) => {
                             debug_assert!(!layout
                                 .content
@@ -2294,7 +2333,7 @@ impl hal::device::Device<Backend> for Device {
                     .iter_mut()
                     .zip(op.descriptors)
                 {
-                    match *descriptor.borrow() {
+                    match descriptor {
                         pso::Descriptor::Sampler(sampler) => {
                             debug_assert!(!bindings[&op.binding]
                                 .content
@@ -2414,6 +2453,7 @@ impl hal::device::Device<Backend> for Device {
         &self,
         size: u64,
         usage: buffer::Usage,
+        _sparse: memory::SparseFlags,
     ) -> Result<n::Buffer, buffer::CreationError> {
         debug!("create_buffer of size {} and usage {:?}", size, usage);
         Ok(n::Buffer::Unbound {
@@ -2596,7 +2636,7 @@ impl hal::device::Device<Backend> for Device {
         let stride = (col_count * (format_desc.bits as u64 / 8) + align_mask) & !align_mask;
 
         Ok(n::BufferView {
-            raw: raw.new_texture_from_contents(&descriptor, start, stride),
+            raw: raw.new_texture_with_descriptor(&descriptor, start, stride),
         })
     }
 
@@ -2611,6 +2651,7 @@ impl hal::device::Device<Backend> for Device {
         format: format::Format,
         tiling: image::Tiling,
         usage: image::Usage,
+        _sparse: memory::SparseFlags,
         view_caps: image::ViewCapabilities,
     ) -> Result<n::Image, image::CreationError> {
         debug!(

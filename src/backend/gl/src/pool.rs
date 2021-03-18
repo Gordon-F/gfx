@@ -1,9 +1,8 @@
 use crate::{
     command::{self, Command, CommandBuffer},
-    info, native as n, Backend,
+    info, native as n, Backend, FastHashMap,
 };
 
-use auxil::FastHashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -95,7 +94,7 @@ impl hal::pool::CommandPool<Backend> for CommandPool {
 
     unsafe fn free<I>(&mut self, buffers: I)
     where
-        I: IntoIterator<Item = CommandBuffer>,
+        I: Iterator<Item = CommandBuffer>,
     {
         let mut memory = self
             .memory

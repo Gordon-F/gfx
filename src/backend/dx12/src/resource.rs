@@ -767,7 +767,7 @@ unsafe impl Send for DescriptorPool {}
 unsafe impl Sync for DescriptorPool {}
 
 impl pso::DescriptorPool<Backend> for DescriptorPool {
-    unsafe fn allocate_set(
+    unsafe fn allocate_one(
         &mut self,
         layout: &DescriptorSetLayout,
     ) -> Result<DescriptorSet, pso::AllocationError> {
@@ -775,7 +775,7 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
         let mut first_gpu_view = None;
         let mut num_samplers = 0;
 
-        info!("allocate_set");
+        info!("allocate_one");
         for binding in &layout.bindings {
             // Add dummy bindings in case of out-of-range or sparse binding layout.
             while binding_infos.len() <= binding.binding as usize {
@@ -844,7 +844,7 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
 
     unsafe fn free<I>(&mut self, descriptor_sets: I)
     where
-        I: IntoIterator<Item = DescriptorSet>,
+        I: Iterator<Item = DescriptorSet>,
     {
         for descriptor_set in descriptor_sets {
             for binding_info in descriptor_set.binding_infos {
@@ -865,7 +865,7 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
 #[derive(Debug)]
 pub struct QueryPool {
     pub(crate) raw: native::QueryHeap,
-    pub(crate) ty: native::QueryHeapType,
+    pub(crate) ty: hal::query::Type,
 }
 
 unsafe impl Send for QueryPool {}

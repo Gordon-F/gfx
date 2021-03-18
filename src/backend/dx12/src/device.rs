@@ -1,6 +1,4 @@
-use std::{
-    borrow::Borrow, collections::hash_map::Entry, ffi, iter, mem, ops::Range, ptr, slice, sync::Arc,
-};
+use std::{collections::hash_map::Entry, ffi, iter, mem, ops::Range, ptr, slice, sync::Arc};
 
 use range_alloc::RangeAllocator;
 use smallvec::SmallVec;
@@ -543,7 +541,6 @@ impl Device {
                     .get_cleansed_entry_point_name(source.entry, execution_model)
                     .map_err(gen_query_error)?;
 
-                let stage = conv::map_execution_model(execution_model);
                 let shader = compile_shader(
                     stage,
                     shader_model,
@@ -709,7 +706,7 @@ impl Device {
         Ok(())
     }
 
-    fn view_image_as_render_target(
+    pub(crate) fn view_image_as_render_target(
         &self,
         info: &ViewInfo,
     ) -> Result<descriptors_cpu::Handle, image::ViewCreationError> {
@@ -797,7 +794,7 @@ impl Device {
         Ok(())
     }
 
-    fn view_image_as_depth_stencil(
+    pub(crate) fn view_image_as_depth_stencil(
         &self,
         info: &ViewInfo,
     ) -> Result<descriptors_cpu::Handle, image::ViewCreationError> {
@@ -1147,6 +1144,109 @@ impl Device {
             acquired_count: 0,
         }
     }
+
+    pub(crate) fn bind_image_resource(
+        &self,
+        resource: native::WeakPtr<d3d12::ID3D12Resource>,
+        image: &mut r::Image,
+        place: r::Place,
+    ) {
+        let image_unbound = image.expect_unbound();
+        let num_layers = image_unbound.kind.num_layers();
+
+        //TODO: the clear_Xv is incomplete. We should support clearing images created without XXX_ATTACHMENT usage.
+        // for this, we need to check the format and force the `RENDER_TARGET` flag behind the user's back
+        // if the format supports being rendered into, allowing us to create clear_Xv
+        let info = ViewInfo {
+            resource,
+            kind: image_unbound.kind,
+            caps: image::ViewCapabilities::empty(),
+            view_kind: match image_unbound.kind {
+                image::Kind::D1(..) => image::ViewKind::D1Array,
+                image::Kind::D2(..) => image::ViewKind::D2Array,
+                image::Kind::D3(..) => image::ViewKind::D3,
+            },
+            format: image_unbound.desc.Format,
+            component_mapping: IDENTITY_MAPPING,
+            levels: 0..1,
+            layers: 0..0,
+        };
+        let format_properties = self
+            .format_properties
+            .resolve(image_unbound.format as usize)
+            .properties;
+        let props = match image_unbound.tiling {
+            image::Tiling::Optimal => format_properties.optimal_tiling,
+            image::Tiling::Linear => format_properties.linear_tiling,
+        };
+        let can_clear_color = image_unbound
+            .usage
+            .intersects(image::Usage::TRANSFER_DST | image::Usage::COLOR_ATTACHMENT)
+            && props.contains(format::ImageFeature::COLOR_ATTACHMENT);
+        let can_clear_depth = image_unbound
+            .usage
+            .intersects(image::Usage::TRANSFER_DST | image::Usage::DEPTH_STENCIL_ATTACHMENT)
+            && props.contains(format::ImageFeature::DEPTH_STENCIL_ATTACHMENT);
+        let aspects = image_unbound.format.surface_desc().aspects;
+
+        *image = r::Image::Bound(r::ImageBound {
+            resource,
+            place,
+            surface_type: image_unbound.format.base_format().0,
+            kind: image_unbound.kind,
+            mip_levels: image_unbound.mip_levels,
+            usage: image_unbound.usage,
+            default_view_format: image_unbound.view_format,
+            view_caps: image_unbound.view_caps,
+            descriptor: image_unbound.desc,
+            clear_cv: if aspects.contains(Aspects::COLOR) && can_clear_color {
+                let format = image_unbound.view_format.unwrap();
+                (0..num_layers)
+                    .map(|layer| {
+                        self.view_image_as_render_target(&ViewInfo {
+                            format,
+                            layers: layer..layer + 1,
+                            ..info.clone()
+                        })
+                        .unwrap()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            clear_dv: if aspects.contains(Aspects::DEPTH) && can_clear_depth {
+                let format = image_unbound.dsv_format.unwrap();
+                (0..num_layers)
+                    .map(|layer| {
+                        self.view_image_as_depth_stencil(&ViewInfo {
+                            format,
+                            layers: layer..layer + 1,
+                            ..info.clone()
+                        })
+                        .unwrap()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            clear_sv: if aspects.contains(Aspects::STENCIL) && can_clear_depth {
+                let format = image_unbound.dsv_format.unwrap();
+                (0..num_layers)
+                    .map(|layer| {
+                        self.view_image_as_depth_stencil(&ViewInfo {
+                            format,
+                            layers: layer..layer + 1,
+                            ..info.clone()
+                        })
+                        .unwrap()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            requirements: image_unbound.requirements,
+        });
+    }
 }
 
 impl d::Device<B> for Device {
@@ -1189,10 +1289,12 @@ impl d::Device<B> for Device {
             .raw
             .clone()
             .CreateHeap(&desc, &d3d12::ID3D12Heap::uuidof(), heap.mut_void());
-        if hr == winerror::E_OUTOFMEMORY {
+        if hr != winerror::S_OK {
+            if hr != winerror::E_OUTOFMEMORY {
+                error!("Error in CreateHeap: 0x{:X}", hr);
+            }
             return Err(d::OutOfMemory::Device.into());
         }
-        assert_eq!(winerror::S_OK, hr);
 
         // The first memory heap of each group corresponds to the default heap, which is can never
         // be mapped.
@@ -1263,19 +1365,16 @@ impl d::Device<B> for Device {
 
     unsafe fn destroy_command_pool(&self, _pool: CommandPool) {}
 
-    unsafe fn create_render_pass<'a, IA, IS, ID>(
+    unsafe fn create_render_pass<'a, Ia, Is, Id>(
         &self,
-        attachments: IA,
-        subpasses: IS,
-        dependencies: ID,
+        attachments: Ia,
+        subpasses: Is,
+        dependencies: Id,
     ) -> Result<r::RenderPass, d::OutOfMemory>
     where
-        IA: IntoIterator,
-        IA::Item: Borrow<pass::Attachment>,
-        IS: IntoIterator,
-        IS::Item: Borrow<pass::SubpassDesc<'a>>,
-        ID: IntoIterator,
-        ID::Item: Borrow<pass::SubpassDependency>,
+        Ia: Iterator<Item = pass::Attachment>,
+        Is: Iterator<Item = pass::SubpassDesc<'a>>,
+        Id: Iterator<Item = pass::SubpassDependency>,
     {
         #[derive(Copy, Clone, Debug, PartialEq)]
         enum SubState {
@@ -1301,19 +1400,15 @@ impl d::Device<B> for Device {
             barrier_start_index: usize,
         }
 
-        let attachments = attachments
-            .into_iter()
-            .map(|attachment| attachment.borrow().clone())
-            .collect::<SmallVec<[_; 5]>>();
+        let attachments = attachments.collect::<SmallVec<[_; 5]>>();
         let mut sub_infos = subpasses
-            .into_iter()
             .map(|desc| SubInfo {
-                desc: desc.borrow().clone(),
+                desc: desc.clone(),
                 external_dependencies: image::Access::empty()..image::Access::empty(),
                 unresolved_dependencies: 0,
             })
             .collect::<SmallVec<[_; 1]>>();
-        let dependencies = dependencies.into_iter().collect::<SmallVec<[_; 2]>>();
+        let dependencies = dependencies.collect::<SmallVec<[_; 2]>>();
 
         let mut att_infos = (0..attachments.len())
             .map(|_| AttachmentInfo {
@@ -1324,7 +1419,6 @@ impl d::Device<B> for Device {
             .collect::<SmallVec<[_; 5]>>();
 
         for dep in &dependencies {
-            let dep = dep.borrow();
             match dep.passes {
                 Range {
                     start: None,
@@ -1413,7 +1507,6 @@ impl d::Device<B> for Device {
             .position(|si| si.unresolved_dependencies == 0)
         {
             for dep in &dependencies {
-                let dep = dep.borrow();
                 if dep.passes.start != dep.passes.end
                     && dep.passes.start == Some(sid as pass::SubpassId)
                 {
@@ -1523,16 +1616,14 @@ impl d::Device<B> for Device {
         Ok(rp)
     }
 
-    unsafe fn create_pipeline_layout<IS, IR>(
+    unsafe fn create_pipeline_layout<'a, Is, Ic>(
         &self,
-        sets: IS,
-        push_constant_ranges: IR,
+        sets: Is,
+        push_constant_ranges: Ic,
     ) -> Result<r::PipelineLayout, d::OutOfMemory>
     where
-        IS: IntoIterator,
-        IS::Item: Borrow<r::DescriptorSetLayout>,
-        IR: IntoIterator,
-        IR::Item: Borrow<(pso::ShaderStageFlags, Range<u32>)>,
+        Is: Iterator<Item = &'a r::DescriptorSetLayout>,
+        Ic: Iterator<Item = (pso::ShaderStageFlags, Range<u32>)>,
     {
         // Pipeline layouts are implemented as RootSignature for D3D12.
         //
@@ -1558,7 +1649,7 @@ impl d::Device<B> for Device {
         // Root Descriptors 1
         //     ...
 
-        let sets = sets.into_iter().collect::<Vec<_>>();
+        let sets = sets.collect::<Vec<_>>();
 
         let mut root_offset = 0u32;
         let root_constants = root_constants::split(push_constant_ranges)
@@ -1614,7 +1705,7 @@ impl d::Device<B> for Device {
             .iter()
             .map(|desc_set| {
                 let mut sum = 0;
-                for binding in desc_set.borrow().bindings.iter() {
+                for binding in desc_set.bindings.iter() {
                     let content = r::DescriptorContent::from(binding.ty);
                     if !content.is_dynamic() {
                         sum += content.bits().count_ones() as usize;
@@ -1629,7 +1720,6 @@ impl d::Device<B> for Device {
             .iter()
             .enumerate()
             .map(|(i, set)| {
-                let set = set.borrow();
                 let space = (root_space_offset + i) as u32;
                 let mut table_type = r::SetTableTypes::empty();
                 let root_table_offset = root_offset;
@@ -1799,10 +1889,9 @@ impl d::Device<B> for Device {
         //empty
     }
 
-    unsafe fn merge_pipeline_caches<I>(&self, _: &(), _: I) -> Result<(), d::OutOfMemory>
+    unsafe fn merge_pipeline_caches<'a, I>(&self, _: &mut (), _: I) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<()>,
+        I: Iterator<Item = &'a ()>,
     {
         //empty
         Ok(())
@@ -2243,6 +2332,7 @@ impl d::Device<B> for Device {
         &self,
         mut size: u64,
         usage: buffer::Usage,
+        _sparse: memory::SparseFlags,
     ) -> Result<r::Buffer, buffer::CreationError> {
         if usage.contains(buffer::Usage::UNIFORM) {
             // Constant buffer view sizes need to be aligned.
@@ -2466,6 +2556,7 @@ impl d::Device<B> for Device {
         format: format::Format,
         tiling: image::Tiling,
         usage: image::Usage,
+        sparse: memory::SparseFlags,
         view_caps: image::ViewCapabilities,
     ) -> Result<r::Image, image::CreationError> {
         assert!(mip_levels <= kind.compute_num_levels());
@@ -2478,15 +2569,22 @@ impl d::Device<B> for Device {
         let extent = kind.extent();
 
         let format_info = self.format_properties.resolve(format as usize);
-        let (layout, features) = match tiling {
-            image::Tiling::Optimal => (
-                d3d12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        let (layout, features) = if sparse.contains(memory::SparseFlags::SPARSE_BINDING) {
+            (
+                d3d12::D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
                 format_info.properties.optimal_tiling,
-            ),
-            image::Tiling::Linear => (
-                d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                format_info.properties.linear_tiling,
-            ),
+            )
+        } else {
+            match tiling {
+                image::Tiling::Optimal => (
+                    d3d12::D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    format_info.properties.optimal_tiling,
+                ),
+                image::Tiling::Linear => (
+                    d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    format_info.properties.linear_tiling,
+                ),
+            }
         };
         if format_info.sample_count_mask & kind.num_samples() == 0 {
             return Err(image::CreationError::Samples(kind.num_samples()));
@@ -2606,8 +2704,6 @@ impl d::Device<B> for Device {
         offset: u64,
         image: &mut r::Image,
     ) -> Result<(), d::BindError> {
-        use self::image::Usage;
-
         let image_unbound = image.expect_unbound();
         if image_unbound.requirements.type_mask & (1 << memory.type_id) == 0 {
             error!(
@@ -2621,7 +2717,6 @@ impl d::Device<B> for Device {
         }
 
         let mut resource = native::Resource::null();
-        let num_layers = image_unbound.kind.num_layers();
 
         assert_eq!(
             winerror::S_OK,
@@ -2640,102 +2735,14 @@ impl d::Device<B> for Device {
             resource.SetName(name.as_ptr());
         }
 
-        let info = ViewInfo {
+        self.bind_image_resource(
             resource,
-            kind: image_unbound.kind,
-            caps: image::ViewCapabilities::empty(),
-            view_kind: match image_unbound.kind {
-                image::Kind::D1(..) => image::ViewKind::D1Array,
-                image::Kind::D2(..) => image::ViewKind::D2Array,
-                image::Kind::D3(..) => image::ViewKind::D3,
-            },
-            format: image_unbound.desc.Format,
-            component_mapping: IDENTITY_MAPPING,
-            levels: 0..1,
-            layers: 0..0,
-        };
-
-        //TODO: the clear_Xv is incomplete. We should support clearing images created without XXX_ATTACHMENT usage.
-        // for this, we need to check the format and force the `RENDER_TARGET` flag behind the user's back
-        // if the format supports being rendered into, allowing us to create clear_Xv
-        let format_properties = self
-            .format_properties
-            .resolve(image_unbound.format as usize)
-            .properties;
-        let props = match image_unbound.tiling {
-            image::Tiling::Optimal => format_properties.optimal_tiling,
-            image::Tiling::Linear => format_properties.linear_tiling,
-        };
-        let can_clear_color = image_unbound
-            .usage
-            .intersects(Usage::TRANSFER_DST | Usage::COLOR_ATTACHMENT)
-            && props.contains(format::ImageFeature::COLOR_ATTACHMENT);
-        let can_clear_depth = image_unbound
-            .usage
-            .intersects(Usage::TRANSFER_DST | Usage::DEPTH_STENCIL_ATTACHMENT)
-            && props.contains(format::ImageFeature::DEPTH_STENCIL_ATTACHMENT);
-        let aspects = image_unbound.format.surface_desc().aspects;
-
-        *image = r::Image::Bound(r::ImageBound {
-            resource: resource,
-            place: r::Place::Heap {
+            image,
+            r::Place::Heap {
                 raw: memory.heap.clone(),
                 offset,
             },
-            surface_type: image_unbound.format.base_format().0,
-            kind: image_unbound.kind,
-            mip_levels: image_unbound.mip_levels,
-            usage: image_unbound.usage,
-            default_view_format: image_unbound.view_format,
-            view_caps: image_unbound.view_caps,
-            descriptor: image_unbound.desc,
-            clear_cv: if aspects.contains(Aspects::COLOR) && can_clear_color {
-                let format = image_unbound.view_format.unwrap();
-                (0..num_layers)
-                    .map(|layer| {
-                        self.view_image_as_render_target(&ViewInfo {
-                            format,
-                            layers: layer..layer + 1,
-                            ..info.clone()
-                        })
-                        .unwrap()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            clear_dv: if aspects.contains(Aspects::DEPTH) && can_clear_depth {
-                let format = image_unbound.dsv_format.unwrap();
-                (0..num_layers)
-                    .map(|layer| {
-                        self.view_image_as_depth_stencil(&ViewInfo {
-                            format,
-                            layers: layer..layer + 1,
-                            ..info.clone()
-                        })
-                        .unwrap()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            clear_sv: if aspects.contains(Aspects::STENCIL) && can_clear_depth {
-                let format = image_unbound.dsv_format.unwrap();
-                (0..num_layers)
-                    .map(|layer| {
-                        self.view_image_as_depth_stencil(&ViewInfo {
-                            format,
-                            layers: layer..layer + 1,
-                            ..info.clone()
-                        })
-                        .unwrap()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            requirements: image_unbound.requirements,
-        });
+        );
 
         Ok(())
     }
@@ -2893,12 +2900,11 @@ impl d::Device<B> for Device {
     unsafe fn create_descriptor_pool<I>(
         &self,
         max_sets: usize,
-        descriptor_pools: I,
+        ranges: I,
         _flags: pso::DescriptorPoolCreateFlags,
     ) -> Result<r::DescriptorPool, d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorRangeDesc>,
+        I: Iterator<Item = pso::DescriptorRangeDesc>,
     {
         // Descriptor pools are implemented as slices of the global descriptor heaps.
         // A descriptor pool will occupy a contiguous space in each heap (CBV/SRV/UAV and Sampler) depending
@@ -2907,13 +2913,10 @@ impl d::Device<B> for Device {
         let mut num_srv_cbv_uav = 0;
         let mut num_samplers = 0;
 
-        let descriptor_pools = descriptor_pools
-            .into_iter()
-            .map(|desc| *desc.borrow())
-            .collect::<Vec<_>>();
+        let ranges = ranges.collect::<Vec<_>>();
 
         info!("create_descriptor_pool with {} max sets", max_sets);
-        for desc in &descriptor_pools {
+        for desc in &ranges {
             let content = r::DescriptorContent::from(desc.ty);
             debug!("\tcontent {:?}", content);
             if content.contains(r::DescriptorContent::CBV) {
@@ -2963,31 +2966,28 @@ impl d::Device<B> for Device {
         Ok(r::DescriptorPool {
             heap_srv_cbv_uav,
             heap_raw_sampler: self.samplers.heap.raw,
-            pools: descriptor_pools,
+            pools: ranges,
             max_size: max_sets as _,
         })
     }
 
-    unsafe fn create_descriptor_set_layout<I, J>(
+    unsafe fn create_descriptor_set_layout<'a, I, J>(
         &self,
         bindings: I,
         _immutable_samplers: J,
     ) -> Result<r::DescriptorSetLayout, d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
-        J: IntoIterator,
-        J::Item: Borrow<r::Sampler>,
+        I: Iterator<Item = pso::DescriptorSetLayoutBinding>,
+        J: Iterator<Item = &'a r::Sampler>,
     {
         Ok(r::DescriptorSetLayout {
-            bindings: bindings.into_iter().map(|b| b.borrow().clone()).collect(),
+            bindings: bindings.collect(),
         })
     }
 
     unsafe fn write_descriptor_set<'a, I>(&self, op: pso::DescriptorSetWrite<'a, B, I>)
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::Descriptor<'a, B>>,
+        I: Iterator<Item = pso::Descriptor<'a, B>>,
     {
         let mut descriptor_updater = self.descriptor_updater.lock();
         descriptor_updater.reset();
@@ -3013,7 +3013,7 @@ impl d::Device<B> for Device {
             let mut src_srv = None;
             let mut src_uav = None;
 
-            match *descriptor.borrow() {
+            match descriptor {
                 pso::Descriptor::Buffer(buffer, ref sub) => {
                     let buffer = buffer.expect_bound();
 
@@ -3242,11 +3242,9 @@ impl d::Device<B> for Device {
 
     unsafe fn flush_mapped_memory_ranges<'a, I>(&self, ranges: I) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a r::Memory, memory::Segment)>,
+        I: Iterator<Item = (&'a r::Memory, memory::Segment)>,
     {
-        for range in ranges {
-            let &(ref memory, ref segment) = range.borrow();
+        for (memory, ref segment) in ranges {
             if let Some(mem) = memory.resource {
                 // map and immediately unmap, hoping that dx12 drivers internally cache
                 // currently mapped buffers.
@@ -3273,11 +3271,9 @@ impl d::Device<B> for Device {
 
     unsafe fn invalidate_mapped_memory_ranges<'a, I>(&self, ranges: I) -> Result<(), d::OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a r::Memory, memory::Segment)>,
+        I: Iterator<Item = (&'a r::Memory, memory::Segment)>,
     {
-        for range in ranges {
-            let &(ref memory, ref segment) = range.borrow();
+        for (memory, ref segment) in ranges {
             if let Some(mem) = memory.resource {
                 let start = segment.offset;
                 let end = segment.size.map_or(memory.size, |s| start + s); // TODO: only need to be end of current mapping
@@ -3319,28 +3315,26 @@ impl d::Device<B> for Device {
         Ok(())
     }
 
-    unsafe fn wait_for_fences<I>(
+    unsafe fn wait_for_fences<'a, I>(
         &self,
         fences: I,
         wait: d::WaitFor,
         timeout_ns: u64,
     ) -> Result<bool, d::WaitError>
     where
-        I: IntoIterator,
-        I::Item: Borrow<r::Fence>,
+        I: Iterator<Item = &'a r::Fence>,
     {
-        let fences = fences.into_iter().collect::<Vec<_>>();
+        let mut count = 0;
         let mut events = self.events.lock();
-        for _ in events.len()..fences.len() {
-            events.push(native::Event::create(false, false));
-        }
 
-        for (&event, fence) in events.iter().zip(fences.iter()) {
+        for fence in fences {
+            if count == events.len() {
+                events.push(native::Event::create(false, false));
+            }
+            let event = events[count];
             synchapi::ResetEvent(event.0);
-            assert_eq!(
-                winerror::S_OK,
-                fence.borrow().raw.set_event_on_completion(event, 1)
-            );
+            assert_eq!(winerror::S_OK, fence.raw.set_event_on_completion(event, 1));
+            count += 1;
         }
 
         let all = match wait {
@@ -3360,7 +3354,7 @@ impl d::Device<B> for Device {
             };
 
             synchapi::WaitForMultipleObjects(
-                fences.len() as u32,
+                count as u32,
                 events.as_ptr() as *const _,
                 all,
                 timeout_ms,
@@ -3372,6 +3366,7 @@ impl d::Device<B> for Device {
         match hr {
             winbase::WAIT_OBJECT_0..=WAIT_OBJECT_LAST => Ok(true),
             winbase::WAIT_ABANDONED_0..=WAIT_ABANDONED_LAST => Ok(true), //TODO?
+            winbase::WAIT_FAILED => Err(d::WaitError::DeviceLost(d::DeviceLost)),
             winerror::WAIT_TIMEOUT => Ok(false),
             _ => panic!("Unexpected wait status 0x{:X}", hr),
         }
@@ -3424,7 +3419,7 @@ impl d::Device<B> for Device {
 
         Ok(r::QueryPool {
             raw: query_heap,
-            ty: heap_ty,
+            ty: query_ty,
         })
     }
 
@@ -3434,13 +3429,138 @@ impl d::Device<B> for Device {
 
     unsafe fn get_query_pool_results(
         &self,
-        _pool: &r::QueryPool,
-        _queries: Range<query::Id>,
-        _data: &mut [u8],
-        _stride: buffer::Stride,
-        _flags: query::ResultFlags,
+        pool: &r::QueryPool,
+        queries: Range<query::Id>,
+        data: &mut [u8],
+        stride: buffer::Stride,
+        flags: query::ResultFlags,
     ) -> Result<bool, d::WaitError> {
-        unimplemented!()
+        let num_queries = queries.end - queries.start;
+        let size = 8 * num_queries as u64;
+        let buffer_desc = d3d12::D3D12_RESOURCE_DESC {
+            Dimension: d3d12::D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: dxgiformat::DXGI_FORMAT_UNKNOWN,
+            SampleDesc: dxgitype::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: d3d12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: d3d12::D3D12_RESOURCE_FLAG_NONE,
+        };
+
+        let properties = d3d12::D3D12_HEAP_PROPERTIES {
+            Type: d3d12::D3D12_HEAP_TYPE_READBACK,
+            CPUPageProperty: d3d12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: d3d12::D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 0,
+            VisibleNodeMask: 0,
+        };
+
+        let heap_desc = d3d12::D3D12_HEAP_DESC {
+            SizeInBytes: size,
+            Properties: properties,
+            Alignment: 0,
+            Flags: d3d12::D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+
+        let mut heap = native::Heap::null();
+        assert_eq!(
+            self.raw
+                .clone()
+                .CreateHeap(&heap_desc, &d3d12::ID3D12Heap::uuidof(), heap.mut_void()),
+            winerror::S_OK
+        );
+
+        let mut temp_buffer = native::Resource::null();
+        assert_eq!(
+            winerror::S_OK,
+            self.raw.clone().CreatePlacedResource(
+                heap.as_mut_ptr(),
+                0,
+                &buffer_desc,
+                d3d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                ptr::null(),
+                &d3d12::ID3D12Resource::uuidof(),
+                temp_buffer.mut_void(),
+            )
+        );
+
+        let list_type = native::CmdListType::Direct;
+        let (com_allocator, hr_alloc) = self.raw.create_command_allocator(list_type);
+        assert_eq!(
+            winerror::S_OK,
+            hr_alloc,
+            "error on command allocator creation: {:x}",
+            hr_alloc
+        );
+        let (com_list, hr_list) = self.raw.create_graphics_command_list(
+            list_type,
+            com_allocator,
+            native::PipelineState::null(),
+            0,
+        );
+        assert_eq!(
+            winerror::S_OK,
+            hr_list,
+            "error on command list creation: {:x}",
+            hr_list
+        );
+
+        let query_ty = match pool.ty {
+            query::Type::Occlusion => d3d12::D3D12_QUERY_TYPE_OCCLUSION,
+            query::Type::PipelineStatistics(_) => d3d12::D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            query::Type::Timestamp => d3d12::D3D12_QUERY_TYPE_TIMESTAMP,
+        };
+        com_list.ResolveQueryData(
+            pool.raw.as_mut_ptr(),
+            query_ty,
+            queries.start,
+            num_queries,
+            temp_buffer.as_mut_ptr(),
+            0,
+        );
+        com_list.close();
+
+        self.queues[0]
+            .raw
+            .ExecuteCommandLists(1, &(com_list.as_mut_ptr() as *mut _));
+
+        if !flags.contains(query::ResultFlags::WAIT) {
+            warn!("Can't really not wait here")
+        }
+        let result = self.queues[0].wait_idle_impl();
+        if result.is_ok() {
+            let mut ptr = ptr::null_mut();
+            assert_eq!(
+                winerror::S_OK,
+                temp_buffer.Map(0, &d3d12::D3D12_RANGE { Begin: 0, End: 0 }, &mut ptr)
+            );
+            let src_data = slice::from_raw_parts(ptr as *const u64, num_queries as usize);
+            for (i, &value) in src_data.iter().enumerate() {
+                let dst = data.as_mut_ptr().add(i * stride as usize);
+                if flags.contains(query::ResultFlags::BITS_64) {
+                    *(dst as *mut u64) = value;
+                } else {
+                    *(dst as *mut u32) = value as u32;
+                }
+            }
+            temp_buffer.Unmap(0, &d3d12::D3D12_RANGE { Begin: 0, End: 0 });
+        }
+
+        temp_buffer.destroy();
+        heap.destroy();
+        com_list.destroy();
+        com_allocator.destroy();
+
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
     }
 
     unsafe fn destroy_shader_module(&self, shader_lib: r::ShaderModule) {

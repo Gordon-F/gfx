@@ -77,10 +77,14 @@ use objc::{
 };
 use parking_lot::{Condvar, Mutex};
 
-use std::mem;
-use std::os::raw::c_void;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    hash::BuildHasherDefault,
+    mem,
+    os::raw::c_void,
+    ptr::NonNull,
+    sync::{Arc, Once},
+};
 
 mod command;
 mod conversions;
@@ -95,6 +99,7 @@ pub use crate::device::{Device, LanguageVersion, PhysicalDevice};
 pub use crate::window::Surface;
 
 pub type GraphicsCommandPool = CommandPool;
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<fxhash::FxHasher>>;
 
 //TODO: investigate why exactly using `u8` here is slower (~5% total).
 /// A type representing Metal binding's resource index.
@@ -163,6 +168,9 @@ impl hal::queue::QueueFamily for QueueFamily {
     }
     fn id(&self) -> QueueFamilyId {
         QueueFamilyId(0)
+    }
+    fn supports_sparse_binding(&self) -> bool {
+        false
     }
 }
 
@@ -308,29 +316,29 @@ extern "C" fn layer_should_inherit_contents_scale_from_window(
     _new_scale: CGFloat,
     _from_window: *mut Object,
 ) -> BOOL {
-    return YES;
+    YES
 }
+
+const CAML_DELEGATE_CLASS: &str = "GfxManagedMetalLayerDelegate";
+static CAML_DELEGATE_REGISTER: Once = Once::new();
 
 #[derive(Debug)]
 struct GfxManagedMetalLayerDelegate(&'static Class);
 
 impl GfxManagedMetalLayerDelegate {
     pub fn new() -> Self {
-        GfxManagedMetalLayerDelegate(match Class::get("GfxManagedMetalLayerDelegate") {
-            Some(class) => class,
-            None => {
-                type Fun = extern "C" fn(&Object, Sel, *mut Object, CGFloat, *mut Object) -> BOOL;
-                let mut decl =
-                    ClassDecl::new("GfxManagedMetalLayerDelegate", class!(NSObject)).unwrap();
-                unsafe {
-                    decl.add_method(
-                        sel!(layer:shouldInheritContentsScale:fromWindow:),
-                        layer_should_inherit_contents_scale_from_window as Fun,
-                    );
-                }
-                decl.register()
+        CAML_DELEGATE_REGISTER.call_once(|| {
+            type Fun = extern "C" fn(&Object, Sel, *mut Object, CGFloat, *mut Object) -> BOOL;
+            let mut decl = ClassDecl::new(CAML_DELEGATE_CLASS, class!(NSObject)).unwrap();
+            unsafe {
+                decl.add_method(
+                    sel!(layer:shouldInheritContentsScale:fromWindow:),
+                    layer_should_inherit_contents_scale_from_window as Fun,
+                );
             }
-        })
+            decl.register();
+        });
+        GfxManagedMetalLayerDelegate(Class::get(CAML_DELEGATE_CLASS).unwrap())
     }
 }
 
@@ -445,7 +453,7 @@ impl hal::Backend for Backend {
     type Surface = Surface;
 
     type QueueFamily = QueueFamily;
-    type CommandQueue = command::CommandQueue;
+    type Queue = command::Queue;
     type CommandBuffer = command::CommandBuffer;
 
     type Memory = native::Memory;
