@@ -143,7 +143,7 @@ fn run() {
     // otherwise it will not be dropped when the event loop exits.
     event_loop.run(move |event, _, control_flow| {
         *control_flow = winit::event_loop::ControlFlow::Wait;
-
+        let mut invalid_surface = false;
         match event {
             winit::event::Event::WindowEvent { event, .. } => match event {
                 winit::event::WindowEvent::CloseRequested => {
@@ -167,12 +167,52 @@ fn run() {
                 }
                 _ => {}
             },
+            winit::event::Event::Resumed => {
+                if invalid_surface {
+                    renderer.recreate_surface(&window);
+                    invalid_surface = false;
+                }
+
+                #[cfg(target_os = "android")]
+                request_android_redraw();
+            }
+            winit::event::Event::Suspended => {
+                invalid_surface = true;
+                renderer.destroy_surface();
+            }
             winit::event::Event::RedrawEventsCleared => {
                 renderer.render();
+            }
+            winit::event::Event::RedrawRequested(_) => {
+                #[cfg(not(target_os = "android"))]
+                window.request_redraw();
+
+                #[cfg(target_os = "android")]
+                if !invalid_surface {
+                    request_android_redraw();
+                }
             }
             _ => {}
         }
     });
+}
+
+#[cfg(target_os = "android")]
+fn request_android_redraw() {
+    match ndk_glue::native_window().as_ref() {
+        Some(native_window) => {
+            let a_native_window: *mut ndk_sys::ANativeWindow = native_window.ptr().as_ptr();
+            let a_native_activity: *mut ndk_sys::ANativeActivity =
+                ndk_glue::native_activity().ptr().as_ptr();
+            unsafe {
+                match (*(*a_native_activity).callbacks).onNativeWindowRedrawNeeded {
+                    Some(callback) => callback(a_native_activity, a_native_window),
+                    None => (),
+                };
+            };
+        }
+        None => (),
+    }
 }
 
 struct Renderer<B: hal::Backend> {
@@ -976,6 +1016,22 @@ where
 
         // Increment our frame
         self.frame += 1;
+    }
+
+    fn recreate_surface(&mut self, window: &winit::window::Window) {
+        let surface = unsafe {
+            self.instance
+                .create_surface(window)
+                .expect("Failed to create a surface!")
+        };
+        self.surface = ManuallyDrop::new(surface);
+    }
+
+    fn destroy_surface(&mut self) {
+        unsafe {
+            let surface = ManuallyDrop::into_inner(ptr::read(&self.surface));
+            self.instance.destroy_surface(surface);
+        }
     }
 }
 

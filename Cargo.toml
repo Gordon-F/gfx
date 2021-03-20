@@ -18,3 +18,10 @@ members = [
 
 [patch."https://github.com/gfx-rs/naga"]
 #naga = { path = "../naga" }
+
+[patch.crates-io]
+khronos-egl = { git = "https://github.com/Gordon-F/khronos-egl.git", rev = "8e7e9566b758cba90f892eeffc7e183ce115b40b" }
+ndk-glue = { git = "https://github.com/MarijnS95/android-ndk-rs.git", rev = "31cb4b7f1c974055439a50c7b9d44c8a0dd89db3", features = ["logger"] }
+ndk = { git = "https://github.com/MarijnS95/android-ndk-rs.git", rev = "31cb4b7f1c974055439a50c7b9d44c8a0dd89db3" }
+ndk-sys = { git = "https://github.com/MarijnS95/android-ndk-rs.git", rev = "31cb4b7f1c974055439a50c7b9d44c8a0dd89db3" }
+winit = { git = "https://github.com/rust-windowing/winit.git", rev = "86748fbc681ea070bc37e90a569c192555b402cd", features = ["web-sys"]}

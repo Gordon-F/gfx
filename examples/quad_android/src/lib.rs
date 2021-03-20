@@ -3,6 +3,7 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../quad/main.rs"));
 #[cfg(target_os = "android")]
 #[cfg_attr(target_os = "android", ndk_glue::main(logger(level = "trace")))]
 fn main() {
+    /*
     {
         log::info!("App started. Waiting for NativeScreen");
         loop {
@@ -15,6 +16,6 @@ fn main() {
             }
         }
     }
-
+    */
     run();
 }

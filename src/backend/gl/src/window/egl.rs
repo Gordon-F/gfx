@@ -198,9 +198,8 @@ impl Inner {
 
         // Testing if context can be binded without surface
         // and creating dummy pbuffer surface if not.
-        let pbuffer = if egl.upcast::<egl::EGL1_5>().is_none()
-            && !display_extensions.contains("EGL_KHR_surfaceless_context")
-        {
+        // Some EGL 1.5 devices does not support EGL_KHR_surfaceless_context (Android Emulator, for example)
+        let pbuffer = if !display_extensions.contains("EGL_KHR_surfaceless_context") {
             let attributes = [egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE];
             egl.create_pbuffer_surface(display, config, &attributes)
                 .map(Some)
@@ -209,6 +208,7 @@ impl Inner {
                     hal::UnsupportedBackend
                 })?
         } else {
+            log::info!("EGL_KHR_surfaceless_context is present. No need to create a dummy pbuffer");
             None
         };
 
