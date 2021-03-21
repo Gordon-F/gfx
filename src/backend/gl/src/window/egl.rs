@@ -457,6 +457,7 @@ impl hal::Instance<crate::Backend> for Instance {
 
     unsafe fn destroy_surface(&self, surface: Surface) {
         let inner = self.inner.lock();
+        inner.egl.make_current(surface.display, None, None, None);
         inner
             .egl
             .destroy_surface(inner.display, surface.raw)
