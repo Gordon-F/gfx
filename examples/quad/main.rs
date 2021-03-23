@@ -168,10 +168,7 @@ fn run() {
                 _ => {}
             },
             winit::event::Event::Resumed => {
-                if invalid_surface {
-                    renderer.recreate_surface(&window);
-                    invalid_surface = false;
-                }
+                renderer.recreate_surface(&window);
 
                 #[cfg(target_os = "android")]
                 request_android_redraw();

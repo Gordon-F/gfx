@@ -67,6 +67,16 @@ type WlEglWindowResizeFun = unsafe extern "system" fn(
 
 type WlEglWindowDestroyFun = unsafe extern "system" fn(window: *const raw::c_void);
 
+#[cfg(target_os = "android")]
+extern "C" {
+    pub fn ANativeWindow_setBuffersGeometry(
+        window: *mut raw::c_void,
+        width: i32,
+        height: i32,
+        format: i32,
+    ) -> i32;
+}
+
 fn open_x_display() -> Option<(ptr::NonNull<raw::c_void>, libloading::Library)> {
     log::info!("Loading X11 library to get the current display");
     unsafe {
@@ -443,6 +453,21 @@ impl hal::Instance<crate::Backend> for Instance {
                 })
         }?;
 
+        #[cfg(target_os = "android")]
+        {
+            let format = inner
+                .egl
+                .get_config_attrib(inner.display, inner.config, egl::NATIVE_VISUAL_ID)
+                .unwrap();
+
+            let ret = ANativeWindow_setBuffersGeometry(native_window_ptr, 0, 0, format);
+
+            if ret != 0 {
+                error!("Error returned from ANativeWindow_setBuffersGeometry");
+                return Err(w::InitError::UnsupportedWindowHandle);
+            }
+        }
+
         Ok(Surface {
             egl: inner.egl.clone(),
             raw,
@@ -457,7 +482,6 @@ impl hal::Instance<crate::Backend> for Instance {
 
     unsafe fn destroy_surface(&self, surface: Surface) {
         let inner = self.inner.lock();
-        inner.egl.make_current(surface.display, None, None, None);
         inner
             .egl
             .destroy_surface(inner.display, surface.raw)
